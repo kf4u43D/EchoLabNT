@@ -1,5 +1,9 @@
 # EchoLabNT
 
+**Current release: [0.7.1-rc.5 (prerelease)](https://github.com/kf4u43D/EchoLabNT/releases/tag/v0.7.1-rc.5).**
+
+[Download the disting NT plug-in](https://github.com/kf4u43D/EchoLabNT/releases/download/v0.7.1-rc.5/EchoLabNT-public-0.7.1-rc.5.zip) · [Release notes and known limitations](https://github.com/kf4u43D/EchoLabNT/releases/tag/v0.7.1-rc.5)
+
 A stereo delay plug-in for Expert Sleepers disting NT, with 20 treatments and 21 musical presets covering analog, tube, tape, platter, digital, multi-head, swept filters, reverse, ducking, auto-volume and looping. Shape repeats with tone, drive, modulation, CV and MIDI clock, or use the internal tempo.
 
 Target: disting NT firmware 1.18.0 / API 13.
