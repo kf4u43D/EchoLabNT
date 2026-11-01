@@ -9,6 +9,7 @@
 /docs/*
 !/docs/INSTALL_NT.md
 !/docs/PRESETS.md
+!/docs/BUILD.md
 /models/registry.json
 /models/README.md
 /models/profiles/
