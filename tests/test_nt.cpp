@@ -14,6 +14,7 @@ static std::vector<_NT_algorithm*> hostAlgorithms;
 struct ParameterWrite { _NT_algorithm* algorithm;int parameter,value; };
 static std::vector<ParameterWrite> queuedWrites,parameterWrites;
 static bool deferParameterWrites=false;
+static bool skipUnchangedParameterWrites=false;
 static unsigned hostParameterErrors=0;
 static constexpr uint32_t hostParameterOffset=7;
 extern "C" int32_t NT_algorithmIndex(const _NT_algorithm* algorithm) {
@@ -22,6 +23,7 @@ extern "C" int32_t NT_algorithmIndex(const _NT_algorithm* algorithm) {
 }
 extern "C" uint32_t NT_parameterOffset() { return hostParameterOffset; }
 static void applyParameterWrite(const ParameterWrite& write) {
+    if(skipUnchangedParameterWrites && write.algorithm->v[write.parameter]==write.value) return;
     const_cast<int16_t*>(write.algorithm->v)[write.parameter]=static_cast<int16_t>(write.value);
     echolab_nt::parameterChanged(write.algorithm,write.parameter);
 }
@@ -34,10 +36,11 @@ extern "C" void NT_setParameterFromAudio(uint32_t algorithm,uint32_t parameter,i
     parameterWrites.push_back(write);
     if(deferParameterWrites) queuedWrites.push_back(write);else applyParameterWrite(write);
 }
-static void flushParameterWrites() {
+static void flushParameterWrites(bool reversed=false) {
     for(int pass=0;!queuedWrites.empty() && pass<16;++pass) {
         const auto writes=queuedWrites;queuedWrites.clear();
-        for(const auto& write:writes) applyParameterWrite(write);
+        if(reversed) for(auto write=writes.rbegin();write!=writes.rend();++write) applyParameterWrite(*write);
+        else for(const auto& write:writes) applyParameterWrite(write);
     }
     if(!queuedWrites.empty()) throw std::runtime_error("host setter callbacks did not settle");
 }
@@ -54,22 +57,32 @@ struct Instance {
     std::vector<int16_t> values;
     _NT_algorithm* self;
     explicit Instance(int32_t seconds = 1, bool limiterEnabled = false,int legacyVoice=0,int productVersion=0,bool reverseCallbacks=false,
-                      bool freeClock=true,int loadedPreset=0) {
+                      bool freeClock=true,int loadedPreset=0,bool productDefaults=false,bool completeInitialCallbacks=true) {
         calculateRequirements(req, &seconds);
         sram.resize(req.sram + 2, 0xad); dram.resize(req.dram + 2, 0xad);
         _NT_algorithmMemoryPtrs ptrs{sram.data()+1, dram.data()+1, nullptr, nullptr};
         self = construct(ptrs, req, &seconds);
         hostAlgorithms.push_back(self);
-        for (const auto& p : parameters) values.push_back(p.def);
-        // Analytic fixtures disable musical gain reduction, keeping the guard.
-        values[LimiterOn]=limiterEnabled ? 1 : 0;
-        values[Voicing]=static_cast<int16_t>(legacyVoice);values[Version]=static_cast<int16_t>(productVersion);
-        values[SyncMode]=freeClock ? 0 : parameters[SyncMode].def;
-        values[FactoryPreset]=static_cast<int16_t>(loadedPreset);
+        for (int p=0;p<ParameterCount;++p) values.push_back((productDefaults ? parameters[p] : baseParameters[p]).def);
+        if(!productDefaults) {
+            // Explicit legacy Digital/Custom fixtures exercise independent DSP
+            // contracts; product default behavior has its own complete test.
+            values[LimiterOn]=limiterEnabled ? 1 : 0;
+            values[Voicing]=static_cast<int16_t>(legacyVoice);values[Version]=static_cast<int16_t>(productVersion);
+            values[SyncMode]=freeClock ? 0 : parameters[SyncMode].def;
+            values[FactoryPreset]=static_cast<int16_t>(loadedPreset);
+        }
         self->v = values.data();
-        for (int i=0; i<ParameterCount; ++i) parameterChanged(self,reverseCallbacks ? ParameterCount-1-i : i);
+        if(completeInitialCallbacks) initialise(reverseCallbacks);
     }
     ~Instance() { const auto index=NT_algorithmIndex(self);if(index>=0) hostAlgorithms[static_cast<std::size_t>(index)]=nullptr; }
+    void initialise(bool reversed=false) {
+        const auto* state=static_cast<const Algorithm*>(self);
+        for(int i=0;i<ParameterCount;++i) {
+            const int p=reversed ? ParameterCount-1-i : i;
+            if(!(state->initialParameters&(std::uint64_t(1)<<p))) parameterChanged(self,p);
+        }
+    }
     void set(int p, int v) { values[p] = static_cast<int16_t>(v); parameterChanged(self, p); }
 };
 static void routing() {
@@ -114,9 +127,9 @@ static void sharedCoreAndInstances(int model) {
     Instance instance;
     instance.set(Model, model);
     near(static_cast<Algorithm*>(instance.self)->engine.parameters().feedback, .28f,
-         "every factory model starts with 28 percent feedback");
+         "the explicit analytic fixture retains its 28 percent feedback setting");
     near(static_cast<Algorithm*>(instance.self)->engine.parameters().mix, .39f,
-         "every factory model starts with 39 percent mix");
+         "the explicit analytic fixture retains its 39 percent mix setting");
     instance.set(OutputModeL, 1); instance.set(OutputModeR, 1);
     instance.set(Time, 10); instance.set(Mix, 800); instance.set(Feedback, 650);
     instance.set(Tone, 1800); instance.set(Drive, 350);
@@ -644,6 +657,45 @@ static void synchronizedStereoNotes() {
     check(!limited->clock.locked() && !pageHas(capped.self,RightDivision),"CV timeout restores manual Stereo controls");
     near(limited->controls.stereo_ratio,1.5f,0,"timeout restores saved manual stereo ratio");
 }
+static void colouredStereoTiming() {
+    for(int model : {1,2,7,9,19}) {
+        Instance i(3);i.set(Model,model);
+        auto* state=static_cast<Algorithm*>(i.self);
+        check(pageHas(i.self,StereoTiming) && !pageHas(i.self,StereoRatio) && !pageHas(i.self,RightDivision),
+              "legacy coloured models expose an opt-in Stereo timing switch without changing their old timing");
+        check(!state->controls.stereo_timing_enabled,"existing coloured instances retain linked timing by default");
+        i.set(SyncMode,3);i.set(TempoBpm,120);i.set(Division,2);i.set(RightDivision,8);i.set(StereoTiming,1);
+        check(pageHas(i.self,StereoTiming) && pageHas(i.self,RightDivision) && !pageHas(i.self,StereoRatio),
+              "enabled coloured stereo uses the same musical right-note editor as Stereo Delays");
+        check(state->controls.stereo_timing_enabled && state->engine.parameters().stereo_timing_enabled,
+              "the appended Stereo timing switch reaches the common DSP rather than selecting a different model");
+        check(state->controls.model==static_cast<echolab::Model>(model),"independent stereo timing preserves the selected analogue character");
+        near(state->controls.delay_ms,500,1e-5f,"coloured left quarter follows 120 BPM");
+        near(state->controls.stereo_ratio,2.0f/3.0f,1e-6f,"coloured right quarter triplet uses an exact independent rhythm");
+        i.set(StereoRatio,175);i.set(SyncMode,1);
+        check(pageHas(i.self,StereoRatio) && !pageHas(i.self,RightDivision),"missing external clock exposes the coloured stereo manual ratio");
+        near(state->controls.stereo_ratio,1.75f,0,"coloured stereo preserves the manual fallback ratio");
+        check(i.values[RightDivision]==8,"manual fallback retains the remembered right musical note");
+        i.set(SyncMode,3);i.set(StereoTiming,0);
+        check(!pageHas(i.self,StereoRatio) && !pageHas(i.self,RightDivision) && !state->controls.stereo_timing_enabled,
+              "disabling coloured stereo restores its linked model and hides inactive right timing controls");
+        i.set(StereoTiming,1);
+        near(state->controls.stereo_ratio,2.0f/3.0f,1e-6f,"re-enabling coloured stereo restores the saved musical rhythm");
+    }
+    Instance capped(1);capped.set(Model,1);capped.set(StereoTiming,1);capped.set(SyncMode,3);
+    capped.set(TempoBpm,60);capped.set(Division,4);capped.set(RightDivision,1);
+    auto* state=static_cast<Algorithm*>(capped.self);
+    near(state->controls.delay_ms,250,0,"a short coloured left note fits a one-second allocation");
+    near(state->controls.stereo_ratio,4,0,"coloured right note independently clamps to memory without stretching the left");
+    draw(capped.self);check(lastDrawText && std::strstr(lastDrawText,"max delay"),"coloured stereo reports right-only capacity clipping");
+    capped.set(StereoTiming,0);draw(capped.self);
+    check(lastDrawText && !std::strstr(lastDrawText,"max delay"),"inactive coloured right timing does not report a false capacity warning");
+    capped.set(Model,0);capped.set(StereoTiming,1);
+    check(!pageHas(capped.self,StereoTiming) && !hasStereoTiming(state),"unsupported models retain the stored switch without exposing a nonfunctional stereo feature");
+    capped.set(Model,15);capped.set(StereoTiming,0);
+    check(hasStereoTiming(state) && pageHas(capped.self,RightDivision) && !pageHas(capped.self,StereoTiming),
+          "the original Stereo Delays model stays independently stereo regardless of the optional coloured-model switch");
+}
 static void modulationCvAliasing() {
     Instance separate,aliased;
     for(Instance* i : {&separate,&aliased}) {
@@ -751,7 +803,9 @@ static void digitalRackInternalRate() {
 }
 static void loresFeMappings() {
     for(bool fullRate : {false,true}) for(bool enabled : {false,true}) for(int source=1;source<=5;++source) {
-        Instance instance;
+        // Restore the inactive Full-Fs route as saved data; live target editing
+        // deliberately skips destinations that do not affect the current model.
+        Instance instance(1,false,0,0,false,true,0,false,false);
         instance.set(Model,5);instance.set(Voicing,3);instance.set(Time,1);instance.set(Mix,1000);instance.set(Feedback,0);
         instance.set(FeedbackLPHz,0);instance.set(FeedbackHPHz,0);instance.set(Drift,0);instance.set(LoResCutoffHz,0);
         instance.set(LoResEnvelopeAmount,0);instance.set(SampleRateHz,fullRate ? 0 : 8000);instance.set(BitDepth,12);
@@ -760,6 +814,7 @@ static void loresFeMappings() {
         instance.set(Mod1Source,source);instance.set(Mod1Destination,8);instance.set(Mod1Amount,500);
         instance.set(Mod2Source,source>=3 ? (source==5 ? 4 : 5) : 0);
         instance.set(Mod2Destination,8);instance.set(Mod2Amount,250);
+        instance.initialise();
         midiMessage(instance.self,0xb2,1,96);
         auto* state=static_cast<Algorithm*>(instance.self);state->engine.reset();
         echolab::Engine expected,unrouted;
@@ -856,7 +911,7 @@ static void musicalTapPagesAndCapacity() {
     draw(instance.self);
     check(lastDrawText && !std::strstr(lastDrawText,"max delay"),"capacity warning clears when both note durations fit");
 }
-static void productionDefaultsAndOptionalColor() {
+static void productionClockAndOptionalColor() {
     Instance production(3,false,0,0,false,false);
     auto* state=static_cast<Algorithm*>(production.self);
     check(production.values[SyncMode]==3 && state->clock.locked() &&
@@ -880,6 +935,229 @@ static void productionDefaultsAndOptionalColor() {
     production.set(Version,1);
     check(!pageHas(production.self,ExciterHighpassOn),"the optional legacy return switch is hidden when the alternate version already has its return filters");
 }
+static void checkRecipe(const Instance& instance,const preset_bank::Preset& preset);
+static void presetsBeforeFirstAudio() {
+    for(bool reversed : {false,true}) for(bool deferred : {false,true}) for(bool skipped : {false,true})
+        for(int slot : {4,1,2,3}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance instance(3,false,0,0,reversed,false);
+        auto* state=static_cast<Algorithm*>(instance.self);
+        instance.set(FactoryPreset,slot);
+        if(slot==4 && state->controls.model!=echolab::Model::Analog)
+            std::cerr << "Before-first-step preset reproduction: initial=" << state->initialControls
+                      << " selected=" << slot << " hostModel=" << instance.values[Model]
+                      << " engineModel=" << static_cast<int>(state->controls.model) << '\n';
+        checkRecipe(instance,preset_bank::presets[slot-1]);
+        flushParameterWrites(reversed);
+        checkRecipe(instance,preset_bank::presets[slot-1]);
+        check(instance.values[FactoryPreset]==slot && state->observedPreset==slot && state->pendingWrites==0,
+              "the first four live recipes apply after parameter initialization without requiring an audio step");
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
+}
+static void partialInitialNotificationsAndUiEdits() {
+    const int firstModels[]={0,10,13,1};
+    for(bool reversed : {false,true}) for(bool deferred : {false,true}) for(bool skipped : {false,true})
+        for(int notificationMode=0;notificationMode<3;++notificationMode) for(int slot=1;slot<=4;++slot) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance instance(3,false,1,0,reversed,true,0,false,false);
+        instance.values[Model]=0;instance.values[Feedback]=517;instance.values[Mix]=627;
+        instance.values[Tone]=1700;instance.values[Drive]=123;
+        const auto loaded=instance.values;
+        const int partial[]={notificationMode==1 ? Model : FactoryPreset,
+                             notificationMode==1 ? Mix : Voicing,
+                             notificationMode==1 ? Tone : Drive};
+        if(notificationMode) for(int p=0;p<3;++p) parameterChanged(instance.self,partial[reversed ? 2-p : p]);
+        auto* state=static_cast<Algorithm*>(instance.self);
+        check(state->initialControls && instance.values==loaded && state->pendingWrites==0,
+              "an incomplete initial callback pass preserves loaded fields without applying their stored recipe label");
+        const auto writesBefore=parameterWrites.size();
+        const auto beforeDraw=state->controls;
+        draw(instance.self);
+        check(state->initialControls && (state->initialUiSnapshot.load(std::memory_order_relaxed)&uiSnapshotPresent) &&
+              parameterWrites.size()==writesBefore && instance.values==loaded &&
+              state->controls.model==beforeDraw.model && state->controls.feedback==beforeDraw.feedback,
+              "draw only marks UI exposure; it never applies a recipe, changes controls or calls an audio setter");
+        const auto firstSnapshot=state->initialUiSnapshot.load(std::memory_order_relaxed);
+        instance.values[FactoryPreset]=static_cast<int16_t>(slot);
+        draw(instance.self);
+        check(state->initialUiSnapshot.load(std::memory_order_relaxed)==firstSnapshot,
+              "a later UI frame cannot replace the selector snapshot captured before the edit");
+        parameterChanged(instance.self,FactoryPreset);
+        check(!state->initialControls && state->controls.model==static_cast<echolab::Model>(firstModels[slot-1]) &&
+              state->visibleModel==firstModels[slot-1],
+              "after UI exposure the first live recipe changes its actual model and pages before any audio step");
+        checkRecipe(instance,preset_bank::presets[slot-1]);
+        flushParameterWrites(reversed);checkRecipe(instance,preset_bank::presets[slot-1]);
+        check(instance.values[FactoryPreset]==slot && state->pendingWrites==0,
+              "partial initialization followed by a live preset persists coherently with delayed or omitted no-op notifications");
+    }
+    for(bool reversed : {false,true}) for(bool deferred : {false,true}) for(int loadedSlot : {0,2,4,15})
+        for(bool completeCallbacks : {false,true}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=true;queuedWrites.clear();
+        Instance saved(3,false,1,0,reversed,true,loadedSlot,false,false);
+        saved.values[Model]=0;saved.values[Feedback]=517;saved.values[Mix]=627;saved.values[Tone]=1700;saved.values[Drive]=123;
+        const auto loaded=saved.values;
+        parameterChanged(saved.self,FactoryPreset);parameterChanged(saved.self,Model);
+        check(saved.values==loaded && static_cast<Algorithm*>(saved.self)->initialControls,
+              "isolated saved-label and model notifications alone do not prove a live recipe selection");
+        if(completeCallbacks) saved.initialise(reversed);
+        else {
+            std::vector<float> buses(kNT_lastBus*4,0.0f);step(saved.self,buses.data(),1);
+        }
+        flushParameterWrites(reversed);
+        const auto* state=static_cast<const Algorithm*>(saved.self);
+        check(!state->initialControls && state->controls.model==echolab::Model::Digital && state->visibleModel==0,
+              "both complete callbacks and the first valid audio step adopt the actual saved model without factory autoapply");
+        for(int p=0;p<ParameterCount;++p) if(p!=FactoryPreset)
+            check(saved.values[p]==loaded[p],"finishing partial or complete saved initialization preserves every sound and routing value");
+        check(saved.values[FactoryPreset]==(loadedSlot==4 && !completeCallbacks ? 0 : loadedSlot),
+              "only the first render corrects an inherited mismatching default label; callback completion preserves saved labels");
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
+}
+static void unchangedLoadedUiSelectorNotifications() {
+    for(bool reversed : {false,true}) for(bool deferred : {false,true}) for(bool skipped : {false,true})
+        for(int notifications=0;notifications<3;++notifications) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance saved(3,false,1,0,reversed,true,4,false,false);
+        saved.values[Model]=0;saved.values[Feedback]=517;saved.values[Mix]=627;
+        saved.values[Tone]=1700;saved.values[Drive]=123;
+        const auto loaded=saved.values;
+        if(notifications==1) parameterChanged(saved.self,Model);
+        else if(notifications==2) saved.initialise(reversed);
+        const auto writesBefore=parameterWrites.size();
+        draw(saved.self);parameterChanged(saved.self,FactoryPreset);
+        flushParameterWrites(reversed);
+        const auto* state=static_cast<const Algorithm*>(saved.self);
+        check(saved.values==loaded && state->controls.model==echolab::Model::Digital && state->controls.feedback==.517f &&
+              state->pendingWrites==0 && parameterWrites.size()==writesBefore,
+              "an unchanged saved Preset4 notification after first draw never reapplies Analog or changes its saved sound");
+        check(state->initialControls==(notifications!=2) && state->initialNormalizationPending,
+              "identical UI notifications keep partial loading open while a complete callback pass releases live editing");
+    }
+    for(bool reversed : {false,true}) for(bool deferred : {false,true}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=true;queuedWrites.clear();
+        Instance saved(3,false,2,1,reversed,true,2,false,false);
+        saved.values[Mod1Destination]=8;saved.values[Mod2Destination]=7;
+        saved.values[SampleRateHz]=0;
+        const auto loaded=saved.values;
+        draw(saved.self);parameterChanged(saved.self,Version);
+        parameterChanged(saved.self,Mod1Destination);parameterChanged(saved.self,Mod2Destination);
+        flushParameterWrites(reversed);
+        for(int p=0;p<ParameterCount;++p) if(p!=FactoryPreset)
+            check(saved.values[p]==loaded[p],
+                  "unchanged Version and inactive saved target notifications after draw preserve their hidden voicing and CV destinations");
+        check(static_cast<Algorithm*>(saved.self)->pendingWrites==0,"unchanged saved selector notifications settle their metadata writes");
+        char text[kNT_parameterStringSize]{};
+        check(parameterString(saved.self,Mod1Destination,8,text)>0 && std::strstr(text,"off"),
+              "the preserved inactive 8bit route remains honestly marked off rather than becoming an audible Mix route");
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
+}
+static void unchangedModelThenPresetAfterFirstDraw() {
+    for(bool deferred : {false,true}) for(bool skipped : {false,true}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance saved(3,false,1,0,false,true,4,false,false);
+        saved.values[Model]=0;saved.values[Feedback]=517;saved.values[Mix]=627;saved.values[Drive]=123;
+        const auto loaded=saved.values;
+        const auto writesBefore=parameterWrites.size();
+        draw(saved.self);
+        auto* state=static_cast<Algorithm*>(saved.self);
+        const auto firstSnapshot=state->initialUiSnapshot.load(std::memory_order_relaxed);
+        parameterChanged(saved.self,Model);draw(saved.self);parameterChanged(saved.self,FactoryPreset);
+        flushParameterWrites();
+        check(saved.values==loaded && state->initialControls && state->controls.model==echolab::Model::Digital &&
+              state->initialUiSnapshot.load(std::memory_order_relaxed)==firstSnapshot &&
+              state->pendingWrites==0 && parameterWrites.size()==writesBefore,
+              "late initial Model then identical Preset4 notifications after draw preserve saved sound and issue no queued Custom or recipe writes");
+        saved.set(FactoryPreset,0);saved.set(FactoryPreset,4);
+        checkRecipe(saved,preset_bank::presets[3]);flushParameterWrites();
+        checkRecipe(saved,preset_bank::presets[3]);
+        check(!state->initialControls && state->controls.model==echolab::Model::Analog && state->pendingWrites==0,
+              "an explicit Custom then Analog choice still reapplies the recipe before the first audio step");
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
+}
+static void analogProductDefaultsAndSavedValues() {
+    check(preset_bank::defaultSlot==4 && parameters[FactoryPreset].def==4 && parameters[Model].def==1,
+          "a newly added NT algorithm selects Analog Bounce as its default recipe and model");
+    const auto& recipe=preset_bank::presets[preset_bank::defaultSlot-1];
+    for(unsigned p=0;p<recipe.count;++p) {
+        const auto& setting=recipe.values[p];
+        if(setting.parameter==Voicing)
+            check(parameters[Voicing].def==0 && echolab::resolvedVoicing(echolab::Model::Analog,parameters[Voicing].def)==
+                  echolab::resolvedVoicing(echolab::Model::Analog,setting.value),
+                  "Auto keeps the canonical Analog A04 sound while preserving the legacy default for a missing Voicing field");
+        else check(parameters[setting.parameter].def==setting.value,
+                   "all other new-instance sound and clock defaults come from the canonical Analog Bounce recipe");
+    }
+    for(bool deferred : {false,true}) for(bool reversed : {false,true}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=true;queuedWrites.clear();
+        const auto writesBefore=parameterWrites.size();
+        Instance fresh(3,false,0,0,reversed,false,0,true);
+        std::vector<float> buses(kNT_lastBus*4,0.0f);step(fresh.self,buses.data(),1);
+        auto* state=static_cast<Algorithm*>(fresh.self);
+        for(unsigned p=0;p<recipe.count;++p) if(recipe.values[p].parameter!=Voicing)
+            check(value(state,recipe.values[p].parameter)==recipe.values[p].value,
+                  "a new NT instance exposes every non-voicing field of the Analog default together");
+        near(state->controls.delay_ms,375,1e-5f,"the Analog default starts on a dotted eighth at 120 BPM");
+        near(state->controls.feedback,.13f,1e-6f,"the Analog default applies the complete recipe feedback");
+        near(state->controls.drive,.428f,1e-6f,"the Analog default applies the complete recipe drive");
+        check(state->observedPreset==4 && fresh.values[FactoryPreset]==4 && state->visibleModel==1 &&
+              state->engine.parameters().model==echolab::Model::Analog && state->controls.voicing==0 &&
+              echolab::resolvedVoicing(state->controls.model,state->engine.parameters().voicing)==1 &&
+              pageHas(fresh.self,Tone) && pageHas(fresh.self,Drive) && pageHas(fresh.self,StereoTiming),
+              "the actual product default label, A04 character, engine and pages agree at startup");
+        check(state->pendingWrites==0 && parameterWrites.size()==writesBefore,
+              "a complete new-instance default requires no recursive preset writes or callback acknowledgements");
+        // Old NT files without Preset55 inherit its new definition default,
+        // while their existing sound fields must remain owned by the host.
+        Instance legacy(3,false,0,0,reversed,true,4,false,false);
+        legacy.set(Model,13);legacy.set(Time,617);legacy.set(Feedback,517);legacy.set(Tone,1700);
+        const auto before=legacy.values;
+        legacy.initialise(reversed);
+        step(legacy.self,buses.data(),1);flushParameterWrites(reversed);
+        const auto* saved=static_cast<const Algorithm*>(legacy.self);
+        check(legacy.values[FactoryPreset]==0 && saved->observedPreset==0,
+              "a legacy sound inheriting the new default recipe ID is identified honestly as Custom");
+        for(int p=0;p<ParameterCount;++p) if(p!=FactoryPreset)
+            check(legacy.values[p]==before[p],"correcting an inherited default recipe label preserves every existing saved NT value");
+        check(saved->controls.model==echolab::Model::DigitalRack && saved->visibleModel==13,
+              "the new Analog default never replaces a saved algorithm model or its pages");
+        Instance changed(3,false,0,0,reversed,false,0,true,false);
+        changed.set(Drive,123);
+        const auto changedBefore=changed.values;
+        changed.initialise(reversed);
+        step(changed.self,buses.data(),1);flushParameterWrites(reversed);
+        check(changed.values[FactoryPreset]==0 && static_cast<Algorithm*>(changed.self)->observedPreset==0,
+              "a customized saved Analog default is named Custom instead of claiming the current complete recipe");
+        for(int p=0;p<ParameterCount;++p) if(p!=FactoryPreset)
+            check(changed.values[p]==changedBefore[p],"relabeling a customized saved default preserves its exact sound controls");
+        Instance clocked(3,false,0,0,reversed,false,0,true,false);
+        clocked.set(SyncMode,1);clocked.set(TempoBpm,93);clocked.set(ClockBus,5);clocked.set(ClockPpqn,1);
+        clocked.set(InputL,3);clocked.set(InputR,3);clocked.set(OutputL,17);clocked.set(OutputR,18);
+        clocked.set(CV1Bus,6);clocked.set(Time,617);
+        const auto clockedBefore=clocked.values;
+        clocked.initialise(reversed);
+        step(clocked.self,buses.data(),1);flushParameterWrites(reversed);
+        check(clocked.values==clockedBefore && static_cast<Algorithm*>(clocked.self)->observedPreset==4,
+              "clock source, tempo, clock/CV/audio buses and manual fallback do not invalidate an otherwise complete Analog default recipe");
+        for(int model : {0,7,13}) {
+            Instance absentVoice(3,false,0,0,reversed,false,0,true,false);
+            absentVoice.set(Model,model);
+            check(absentVoice.values[Voicing]==0,"old files without Voicing51 inherit its unchanged Auto definition default");
+            absentVoice.initialise(reversed);
+            step(absentVoice.self,buses.data(),1);flushParameterWrites(reversed);
+            const auto* old=static_cast<const Algorithm*>(absentVoice.self);
+            const int expected=model==0 ? 2 : (model==7 ? 1 : 3);
+            check(absentVoice.values[Voicing]==0 && old->controls.voicing==0 &&
+                  echolab::resolvedVoicing(old->controls.model,old->engine.parameters().voicing)==expected,
+                  "missing legacy Voicing51 retains Digital, Tape and Rack's distinct automatic characters");
+        }
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
+}
 static bool recipeGlobal(int parameter) { return parameter==SyncMode || parameter==TempoBpm || parameter==ClockPpqn; }
 static void checkRecipe(const Instance& instance,const preset_bank::Preset& preset) {
     const auto* state=static_cast<const Algorithm*>(instance.self);
@@ -891,6 +1169,76 @@ static void checkRecipe(const Instance& instance,const preset_bank::Preset& pres
           state->controls.wet_tone_enabled==(value(state,WetToneOn)!=0),"recipe flags, model and musical taps reach the shared core together");
     near(state->controls.feedback,value(state,Feedback)*.001f,1e-6f,"recipe feedback matches its visible parameter");
     near(state->controls.mix,value(state,Mix)*.001f,1e-6f,"recipe mix matches its visible parameter");
+}
+static void modelThenPresetWithUnchangedHostWrites() {
+    // The actual host need not call parameterChanged for a write that leaves v
+    // unchanged. A mock that always acknowledges those writes hid this failure.
+    for(bool skipped : {false,true}) for(bool deferred : {false,true}) for(bool reversed : {false,true})
+        for(int initialPreset : {-1,0,1,21}) for(int selected : {1,21,23}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance instance(3,false,0,0,reversed,false,std::max(0,initialPreset),false,initialPreset<=0);
+        if(initialPreset>0) {
+            // Populate an actual saved NT recipe before its first audio step;
+            // loading must retain saved values instead of reapplying a recipe.
+            const auto& saved=preset_bank::presets[initialPreset-1];
+            for(unsigned p=0;p<saved.count;++p)
+                instance.values[saved.values[p].parameter]=saved.values[p].value;
+            instance.initialise(reversed);
+        }
+        std::vector<float> buses(kNT_lastBus*4,0.0f);step(instance.self,buses.data(),1);
+        // -1 first applies the largely-default Clean recipe, reproducing the
+        // no-op Model write; 0 starts from Custom without any prior recipe.
+        if(initialPreset<0) { instance.set(FactoryPreset,1);flushParameterWrites(reversed); }
+        instance.set(Model,16);
+        auto* state=static_cast<Algorithm*>(instance.self);
+        check(value(state,FactoryPreset)==0 && state->observedPreset==0 && state->controls.model==echolab::Model::LoopSampler &&
+              state->visibleModel==16 && pageHas(instance.self,LoopAction),
+              "a manual Model edit immediately selects Custom and publishes the correct model pages");
+        const auto verifySelection=[&](int slot,bool settled) {
+            const auto& recipe=preset_bank::presets[slot-1];
+            checkRecipe(instance,recipe);
+            const int model=value(state,Model);
+            check(value(state,FactoryPreset)==slot && state->observedPreset==slot && state->visibleModel==model &&
+                  state->engine.parameters().model==static_cast<echolab::Model>(model) &&
+                  pageHas(instance.self,LoopAction)==(model==16) &&
+                  pageHas(instance.self,StereoTiming)==colouredStereoModel(model),
+                  "explicit recipe selection keeps its label, cached controls, engine and model pages coherent");
+            if(settled) {
+                if(state->pendingWrites!=0 || instance.values[Model]!=model)
+                    std::cerr << "Model/Preset no-op callback reproduction: skip=" << skipped << " deferred=" << deferred
+                              << " initial=" << initialPreset << " selected=" << slot << " hostModel=" << instance.values[Model]
+                              << " engineModel=" << model << " pending=" << state->pendingWrites << '\n';
+                check(state->pendingWrites==0 && instance.values[FactoryPreset]==slot && instance.values[Model]==model,
+                      "manual Model then Preset settles without waiting for unchanged-write callbacks");
+                for(unsigned p=0;p<recipe.count;++p) if(!recipeGlobal(recipe.values[p].parameter))
+                    check(instance.values[recipe.values[p].parameter]==recipe.values[p].value,
+                          "every selected recipe field reaches host-owned storage after acknowledgement");
+            }
+        };
+        instance.set(FactoryPreset,selected);verifySelection(selected,false);
+        flushParameterWrites(reversed);verifySelection(selected,true);
+        // Re-select the same recipe after a new manual model, then supersede it
+        // rapidly while older Custom and recipe writes may still be in flight.
+        instance.set(Model,7);instance.set(FactoryPreset,selected);verifySelection(selected,false);
+        instance.set(FactoryPreset,23);instance.set(Model,16);instance.set(FactoryPreset,22);instance.set(FactoryPreset,21);
+        verifySelection(21,false);flushParameterWrites(reversed);verifySelection(21,true);
+    }
+    skipUnchangedParameterWrites=false;deferParameterWrites=false;
+}
+static void versionOverrideAcknowledgementRefreshesControls() {
+    deferParameterWrites=true;skipUnchangedParameterWrites=true;queuedWrites.clear();
+    Instance instance(3);std::vector<float> buses(kNT_lastBus*4,0.0f);step(instance.self,buses.data(),1);
+    instance.set(Model,1);instance.set(Voicing,3);instance.set(Version,1);
+    flushParameterWrites();
+    instance.set(Version,0);instance.set(Voicing,2);flushParameterWrites();
+    auto* state=static_cast<Algorithm*>(instance.self);
+    if(state->controls.voicing!=2)
+        std::cerr << "Voicing ack reproduction: hostVoicing=" << instance.values[Voicing]
+                  << " controlsVoicing=" << state->controls.voicing << " pendingOverride=" << state->pendingVoicing << '\n';
+    check(instance.values[Version]==0 && instance.values[Voicing]==2 && state->pendingWrites==0 && state->pendingVoicing<0 &&
+          state->controls.voicing==2 && state->engine.parameters().voicing==2 && state->visibleVoicing==2,
+          "acknowledging a superseded Version voicing override refreshes actual controls and pages to the latest saved voicing");
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
 }
 static void factoryPresetBank() {
     for(bool deferred : {false,true}) for(unsigned active=0;active<preset_bank::count;++active) {
@@ -994,12 +1342,14 @@ static void recipesPreserveLiveClock() {
           "recipes retain the CV clock source, pulse rate, bus and lock");
 }
 static void stablePresetSlots() {
-    check(preset_bank::count==17 && preset_bank::slotCount==20 && activePreset(18) && activePreset(19) && activePreset(20),
-          "the curated bank preserves Filter slots and appends Platter without compacting saved IDs");
+    check(preset_bank::count==21 && preset_bank::slotCount==24 && activePreset(18) && activePreset(19) && activePreset(20) &&
+          activePreset(21) && activePreset(22) && activePreset(23) && activePreset(24),
+          "the curated bank preserves old slots and appends Swell after the coloured stereo recipes without reusing retired IDs");
     for(bool deferred : {false,true}) for(int saved : {15,16,17}) {
         deferParameterWrites=deferred;queuedWrites.clear();
-        Instance old(3,false,1,0,true,true,saved);
+        Instance old(3,false,1,0,true,true,saved,false,false);
         old.set(Model,4);old.set(TapPattern,saved-7);
+        old.initialise(true);
         std::vector<float> buses(kNT_lastBus*128,0.0f);step(old.self,buses.data(),32);
         auto* state=static_cast<Algorithm*>(old.self);
         check(old.values[FactoryPreset]==saved && state->controls.model==echolab::Model::MultiHead &&
@@ -1018,6 +1368,25 @@ static void stablePresetSlots() {
               "the appended Platter slot is usable without stealing any older recipe ID");
     }
     deferParameterWrites=false;
+}
+static void swellFactoryPreset() {
+    for(bool deferred : {false,true}) for(bool skipped : {false,true}) {
+        deferParameterWrites=deferred;skipUnchangedParameterWrites=skipped;queuedWrites.clear();
+        Instance instance(3);std::vector<float> buses(kNT_lastBus*4,0.0f);step(instance.self,buses.data(),1);
+        instance.set(Model,1);instance.set(Mix,200);instance.set(Swell,100);
+        instance.set(FactoryPreset,24);
+        auto* state=static_cast<Algorithm*>(instance.self);
+        checkRecipe(instance,preset_bank::presets[23]);
+        check(state->controls.model==echolab::Model::AutoVolume && pageHas(instance.self,Swell),
+              "Swell uses the actual Auto-Volume engine and exposes its functional envelope controls");
+        near(state->controls.mix,1,0,"Swell replaces an old dry mix with a fully wet signal");
+        near(state->controls.swell_ms,1200,0,"Swell replaces a previous rise time with its 1200ms recipe");
+        flushParameterWrites();checkRecipe(instance,preset_bank::presets[23]);
+        check(instance.values[FactoryPreset]==24 && instance.values[Model]==12 && instance.values[Mix]==1000 &&
+              instance.values[Swell]==1200 && state->pendingWrites==0,
+              "Swell's model, mix and rise persist coherently with immediate or deferred/no-op host notifications");
+    }
+    deferParameterWrites=false;skipUnchangedParameterWrites=false;
 }
 static void meaningfulModulationRouting() {
     Instance i;std::vector<float> buses(kNT_lastBus*128,0.0f);step(i.self,buses.data(),32);
@@ -1095,6 +1464,53 @@ static void meaningfulModulationRouting() {
         }
     }
 }
+static void extendedModulationTargets() {
+    Instance i;std::vector<float> buses(kNT_lastBus*128,0.0f);step(i.self,buses.data(),32);
+    auto* state=static_cast<Algorithm*>(i.self);
+    char text[kNT_parameterStringSize]{};
+    i.set(CV1Bus,3);i.set(Mod1Source,3);i.set(Model,7);i.set(Mod1Destination,9);i.set(Mod1Amount,250);
+    check(i.values[Mod1Destination]==9 && state->controls.mod1_destination==9 &&
+          parameterString(i.self,Mod1Destination,9,text)>0 && std::strcmp(text,"Mod rate")==0,
+          "the appended Mod rate target is selectable for Tape without changing IDs0to8");
+    i.set(ModulationEnabled,0);
+    check(parameterString(i.self,Mod1Destination,9,text)>0 && std::strcmp(text,"Mod rate (off)")==0,
+          "rate routing reflects the internal movement master switch");
+    i.set(ModulationEnabled,1);i.set(StereoTiming,0);i.set(Mod1Destination,10);
+    check(i.values[Mod1Destination]==0,"unavailable coloured stereo ratio routing skips rather than advertising an inactive target");
+    i.set(StereoTiming,1);i.set(SyncMode,3);i.set(RightDivision,8);i.set(Mod1Destination,10);
+    check(i.values[Mod1Destination]==10 && state->controls.mod1_destination==10 &&
+          parameterString(i.self,Mod1Destination,10,text)>0 && std::strcmp(text,"Stereo ratio")==0,
+          "stereo ratio CV remains available around the resolved right-note ratio in sync");
+    i.set(Model,1);i.set(Version,1);i.set(Mod1Destination,11);
+    check(i.values[Mod1Destination]==11 && state->controls.mod1_destination==11,
+          "Drift routing is exposed where the alternate analogue voice actually uses it");
+    i.set(Version,0);
+    check(parameterString(i.self,Mod1Destination,11,text)>0 && std::strcmp(text,"Drift (off)")==0,
+          "a remembered Drift route is preserved and marked inactive for original A04 character");
+    i.set(Model,6);i.set(ModulationEnabled,0);i.set(Mod1Destination,12);
+    check(i.values[Mod1Destination]==12 && state->controls.mod1_destination==12 &&
+          parameterString(i.self,Mod1Destination,12,text)>0 && std::strcmp(text,"Duck amount")==0,
+          "functional duck amount CV remains available independently of internal modulation");
+    i.set(Model,12);i.set(Mod1Destination,12);
+    check(pageHas(i.self,DuckAmount) && pageHas(i.self,Attack) && pageHas(i.self,Release) && pageHas(i.self,Swell) &&
+          parameterString(i.self,Mod1Destination,12,text)>0 && std::strcmp(text,"Duck amount")==0,
+          "Auto-Volume exposes its tail duck amount and the functional CV target even with internal modulation off");
+    i.set(Model,0);i.set(ModulationEnabled,1);i.set(Mod2Source,1);i.set(Mod1Destination,9);
+    check(i.values[Mod1Destination]==9 && pageHas(i.self,ModRate),"an internally mapped LFO makes its rate both editable and routable on Digital");
+    i.set(Mod2Source,0);
+    check(parameterString(i.self,Mod1Destination,9,text)>0 && std::strcmp(text,"Mod rate (off)")==0,
+          "removing the last LFO source marks an otherwise ineffective Digital rate route off");
+    i.set(WetToneOn,1);i.set(ExciterHighpassOn,1);i.set(Mod1Source,1);i.set(Mod2Source,2);
+    for(int model=0;model<echolab::modelCount;++model) for(int voice=0;voice<=3;++voice)
+        for(int stereo=0;stereo<=1;++stereo) for(int sync : {0,3}) {
+            i.set(Model,model);i.set(Voicing,voice);i.set(StereoTiming,stereo);i.set(SyncMode,sync);
+            check(i.self->parameterPages->numPages<=ARRAY_SIZE(state->pageStorage),"all expanded mapping and coloured stereo page combinations fit bounded storage");
+            for(uint32_t page=0;page<i.self->parameterPages->numPages;++page) {
+                const auto& definition=i.self->parameterPages->pages[page];
+                for(unsigned p=0;p<definition.numParams;++p) check(definition.params[p]<ParameterCount,"expanded pages contain only registered stable parameter IDs");
+            }
+        }
+}
 static void stereoWeaveMonoRouting() {
     for(bool bothInputs : {false,true}) {
         Instance instance(3,false,0,0,false,false);
@@ -1132,40 +1548,46 @@ int main() {
         const auto* f = reinterpret_cast<const _NT_factory*>(pluginEntry(kNT_selector_factoryInfo,0));
         check(f && f->guid == NT_MULTICHAR('E','L','n','t'),"stable GUID");
         check(std::strcmp(f->name,"EchoLabNT")==0,"exact displayed project name");
-        static_assert(Model==6 && Time==7 && Bypass==12 && BitDepth==13 && LoopAction==22 && LimiterOn==23 && Division==42 && FeedbackLPHz==43 && Drift==44 && FeedbackHPHz==45 && LoResEndHz==46 && LoResDecayMs==47 && LoResEnvelopeAmount==48 && RackSampleRateHz==49 && LoResCutoffHz==50 && Voicing==51 && ModulationEnabled==52 && Version==53 && RightDivision==54 && FactoryPreset==55 && ExciterHighpassOn==56 && WetToneOn==57 && ParameterCount==58,"published parameter IDs remain stable; controls appended");
-        check(parameters[Model].max==19 && parameters[Model].def==0 && ARRAY_SIZE(modelNames)==20,
+        check(std::strstr(f->description,ECHOLAB_BUILD_ID) && !std::strstr(f->description,"provisional") &&
+              !std::strstr(f->description,"original"),"the concise factory description retains its build ID without model provenance suffixes");
+        for(const char* label:modelNames)
+            check(!std::strstr(label,"(provisional)") && !std::strstr(label,"(original)"),"displayed model names omit provenance suffixes");
+        static_assert(Model==6 && Time==7 && Bypass==12 && BitDepth==13 && LoopAction==22 && LimiterOn==23 && Division==42 && FeedbackLPHz==43 && Drift==44 && FeedbackHPHz==45 && LoResEndHz==46 && LoResDecayMs==47 && LoResEnvelopeAmount==48 && RackSampleRateHz==49 && LoResCutoffHz==50 && Voicing==51 && ModulationEnabled==52 && Version==53 && RightDivision==54 && FactoryPreset==55 && ExciterHighpassOn==56 && WetToneOn==57 && StereoTiming==58 && ParameterCount==59,"published parameter IDs remain stable; controls appended");
+        check(parameters[Model].max==19 && parameters[Model].def==1 && ARRAY_SIZE(modelNames)==20,
               "20 selectors without changing existing model IDs");
-        check(parameters[Feedback].def==280 && echolab::Parameters{}.feedback==.28f &&
-              parameters[Mix].def==390 && echolab::Parameters{}.mix==.39f && parameters[ModRate].def==100 && parameters[ModDepth].def==600 && parameters[ExciterAmount].def==100 &&
-              parameters[ExciterTuneHz].def==4000 && parameters[Swell].def==250 && parameters[LimiterReleaseMs].def==150 &&
+        check(baseParameters[Feedback].def==280 && echolab::Parameters{}.feedback==.28f &&
+              baseParameters[Mix].def==390 && echolab::Parameters{}.mix==.39f && baseParameters[ModRate].def==100 && baseParameters[ModDepth].def==600 && baseParameters[ExciterAmount].def==100 &&
+              baseParameters[ExciterTuneHz].def==4000 && baseParameters[Swell].def==250 && baseParameters[LimiterReleaseMs].def==150 &&
               parameters[LimiterCeiling].max==891 && parameters[LimiterCeiling].def==891 &&
-              parameters[FeedbackLPHz].def==12000 && parameters[Drift].def==250 && parameters[FeedbackHPHz].def==80 &&
-              parameters[LoResEndHz].def==1200 && parameters[LoResDecayMs].def==1500 && parameters[LoResEnvelopeAmount].def==1000 && parameters[RackSampleRateHz].def==16000 &&
-              parameters[LoResCutoffHz].def==2000 && parameters[Voicing].def==0 && parameters[ModulationEnabled].def==1 &&
-              parameters[Version].min==0 && parameters[Version].max==1 && parameters[Version].def==0 && parameters[RightDivision].def==0 &&
-              parameters[SyncMode].def==3 && parameters[TempoBpm].def==120 && parameters[Division].def==2 &&
-              parameters[FactoryPreset].def==0 && parameters[FactoryPreset].max==static_cast<int>(preset_bank::slotCount) &&
-              parameters[ExciterHighpassOn].def==0 && parameters[WetToneOn].def==0 && parameters[TapPattern].max==10,
-              "published musical defaults, Lo Res envelope and -1dB NT maximum");
-        check(std::strcmp(modelNames[8],"Sweep Down (provisional)")==0 && std::strcmp(modelNames[18],"Sweep Up (provisional)")==0,
+              baseParameters[FeedbackLPHz].def==12000 && baseParameters[Drift].def==250 && baseParameters[FeedbackHPHz].def==80 &&
+              baseParameters[LoResEndHz].def==1200 && baseParameters[LoResDecayMs].def==1500 && baseParameters[LoResEnvelopeAmount].def==1000 && baseParameters[RackSampleRateHz].def==16000 &&
+              baseParameters[LoResCutoffHz].def==2000 && baseParameters[Voicing].def==0 && baseParameters[ModulationEnabled].def==1 &&
+              parameters[Version].min==0 && parameters[Version].max==1 && baseParameters[Version].def==0 && baseParameters[RightDivision].def==0 &&
+              baseParameters[SyncMode].def==3 && baseParameters[TempoBpm].def==120 && baseParameters[Division].def==2 &&
+              baseParameters[FactoryPreset].def==0 && parameters[FactoryPreset].max==static_cast<int>(preset_bank::slotCount) &&
+              baseParameters[ExciterHighpassOn].def==0 && baseParameters[WetToneOn].def==0 && baseParameters[StereoTiming].def==0 && parameters[TapPattern].max==10,
+              "legacy analytic fixture values and the unchanged -1dB NT maximum");
+        check(std::strcmp(modelNames[8],"Sweep Down")==0 && std::strcmp(modelNames[18],"Sweep Up")==0,
               "Sweep Down keeps ID8 and Sweep Up appends ID18");
-        check(std::strcmp(modelNames[19],"Tube A (provisional)")==0 && parameters[Mod1Destination].max==8 && parameters[Mod2Destination].max==8 &&
-              std::strcmp(destinationNames[8],"8bit rate")==0 && std::strcmp(modelNames[5],"8bit (provisional)")==0,
+        check(std::strcmp(modelNames[19],"Tube A")==0 && parameters[Mod1Destination].max==12 && parameters[Mod2Destination].max==12 &&
+              std::strcmp(destinationNames[8],"8bit rate")==0 && std::strcmp(destinationNames[9],"Mod rate")==0 &&
+              std::strcmp(destinationNames[10],"Stereo ratio")==0 && std::strcmp(destinationNames[11],"Drift")==0 &&
+              std::strcmp(destinationNames[12],"Duck amount")==0 && std::strcmp(modelNames[5],"8bit")==0,
               "product labels use A/B and 8bit without changing published selectors");
         check(std::strcmp(modelNames[0],"Digital control")==0 &&
-              std::strcmp(modelNames[1],"Analog (provisional)")==0 &&
-              std::strcmp(modelNames[2],"Tube B (provisional)")==0 &&
-              std::strcmp(modelNames[3],"Ping Pong (provisional)")==0 &&
-              std::strcmp(modelNames[4],"Multi-Head (provisional)")==0,"stable and explicit model labels");
+              std::strcmp(modelNames[1],"Analog")==0 &&
+              std::strcmp(modelNames[2],"Tube B")==0 &&
+              std::strcmp(modelNames[3],"Ping Pong")==0 &&
+              std::strcmp(modelNames[4],"Multi-Head")==0,"stable and concise model labels");
         int32_t a=1,b=8;
         _NT_algorithmRequirements low{},high{};
         calculateRequirements(low,&a); calculateRequirements(high,&b);
         check(high.dram>low.dram && low.numParameters==ParameterCount,"bounded spec memory");
-        routing();
+        presetsBeforeFirstAudio();partialInitialNotificationsAndUiEdits();unchangedLoadedUiSelectorNotifications();unchangedModelThenPresetAfterFirstDraw();analogProductDefaultsAndSavedValues();modelThenPresetWithUnchangedHostWrites();versionOverrideAcknowledgementRefreshesControls();routing();
         for(int model=0;model<echolab::modelCount;++model) sharedCoreAndInstances(model);
         statefulModelAliases(); analyticalNewModelRouting(); bypassAndNonfinite(); appendedControls();
-        dynamicPagesAndControls();musicalTapPagesAndCapacity();finalBusLimiter();singleMusicalStage();clockAndCvAliasing();timingPageFollowsClock();versionMigrationAndSelection();synchronizedStereoNotes();modulationCvAliasing();depthCvAndWheelRouting();
-        digitalRackInternalRate();loresFeMappings();firstPresetLoopLength();productionDefaultsAndOptionalColor();factoryPresetBank();recipesPreserveLiveClock();stablePresetSlots();meaningfulModulationRouting();stereoWeaveMonoRouting();
+        dynamicPagesAndControls();musicalTapPagesAndCapacity();finalBusLimiter();singleMusicalStage();clockAndCvAliasing();timingPageFollowsClock();versionMigrationAndSelection();synchronizedStereoNotes();colouredStereoTiming();modulationCvAliasing();depthCvAndWheelRouting();
+        digitalRackInternalRate();loresFeMappings();firstPresetLoopLength();productionClockAndOptionalColor();factoryPresetBank();recipesPreserveLiveClock();stablePresetSlots();swellFactoryPreset();meaningfulModulationRouting();extendedModulationTargets();stereoWeaveMonoRouting();
         check(hostParameterErrors==0,"host parameter writes use valid algorithms, ranges and the required parameter offset");
         std::cout << "NT adapter: complete catalog, appended controls, analytical ping-pong/multi-head, stateful bus aliases, modes, None, bounds, instance isolation, core parity passed\n";
         return 0;

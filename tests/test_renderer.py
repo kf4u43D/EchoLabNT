@@ -1,6 +1,7 @@
 """Synthetic end-to-end renderer contract; never a reference fidelity test."""
 import json
 import hashlib
+import math
 from pathlib import Path
 import struct
 import subprocess
@@ -231,6 +232,41 @@ class RendererContract(unittest.TestCase):
         self.assertFalse(metadata["controls"]["exciter_highpass_enabled"])
         self.assertFalse(metadata["controls"]["wet_tone_enabled"])
 
+    def test_coloured_stereo_presets_have_independent_first_arrivals(self):
+        write_wave(self.input,[.125]+[0]*31)
+        profiles=Path(__file__).resolve().parents[1]/"models/presets"
+        for name,left_ms,right_ms in (("analog_stereo",375,500),("tube_stereo",500,1000/3),
+                                      ("tape_stereo",250,375)):
+            with self.subTest(preset=name):
+                self.run_renderer("--profile",profiles/(name+".profile"),"--mix",1,"--feedback",0,
+                                  "--modulation-enabled",0,"--limiter",0,"--tail",.75)
+                metadata=json.loads(Path(str(self.output)+".json").read_text())
+                self.assertTrue(metadata["controls"]["stereo_timing_enabled"])
+                self.assertAlmostEqual(metadata["rhythm"]["effective_left_ms"],left_ms,places=3)
+                self.assertAlmostEqual(metadata["rhythm"]["effective_right_ms"],right_ms,places=3)
+                audio=read_float(self.output)
+                for channel,delay_ms in enumerate((left_ms,right_ms)):
+                    start=int(delay_ms*8)
+                    self.assertTrue(all(sample==0 for sample in audio[channel:2*(start-1):2]))
+                    self.assertGreater(max(abs(sample) for sample in audio[2*start+channel:2*(start+16):2]),1e-7)
+
+    def test_extended_route_names_and_timeline_block_independence(self):
+        write_wave(self.input,[.125 if n%31<4 else 0 for n in range(1000)])
+        events=self.root/"routes.csv"
+        events.write_text("sample,param,value\n0,cv1,0.5\n127,cv1,-1\n500,cv1,1\n")
+        for destination,number in (("mod_rate",9),("stereo_ratio",10),("drift",11),("duck_amount",12)):
+            with self.subTest(destination=destination):
+                expected=None
+                for block in (1,24,511):
+                    self.run_renderer("--model","dynamic" if number==12 else "tape","--delay-ms",5,
+                        "--stereo-timing-enabled",1,"--mod1-source","cv1","--mod1-destination",destination,
+                        "--mod1-amount",.2,"--events",events,"--tail",0,"--block",block)
+                    actual=self.output.read_bytes()
+                    if expected is None:expected=actual
+                    else:self.assertEqual(actual,expected)
+                metadata=json.loads(Path(str(self.output)+".json").read_text())
+                self.assertEqual(metadata["controls"]["mod1_destination"],number)
+
     def test_profile_override_and_events_block_invariance(self):
         write_wave(self.input, [((i*17) % 101 - 50) / 100 for i in range(1000)])
         profile = self.root / "control.profile"
@@ -300,7 +336,8 @@ class RendererContract(unittest.TestCase):
                         ("--modulation-enabled", 2), ("--tap-pattern", 11),
                         ("--sync-mode", "midi"), ("--tempo-bpm", 29), ("--tempo-bpm", 301),
                         ("--division", "1/7"), ("--right-division", "1/3"),
-                        ("--exciter-highpass-enabled", 2), ("--wet-tone-enabled", -1)):
+                        ("--exciter-highpass-enabled", 2), ("--wet-tone-enabled", -1),
+                        ("--stereo-timing-enabled", 2), ("--mod1-destination", 13)):
             with self.subTest(options=options):
                 result = self.run_renderer(*options, success=False)
                 self.assertIn("echolabnt_render:", result.stderr)
@@ -334,7 +371,7 @@ class RendererContract(unittest.TestCase):
                   "feedback_lowpass_hz":0,"drift_amount":0,"feedback_highpass_hz":0,
                   "lores_rate_end_hz":1200,"lores_rate_decay_ms":1500,"lores_rate_envelope_amount":0,
                   "digital_rack_rate_hz":0,"lores_cutoff_hz":0,"voicing":0,"modulation_enabled":1,
-                  "exciter_highpass_enabled":0,"wet_tone_enabled":0}
+                  "exciter_highpass_enabled":0,"wet_tone_enabled":0,"stereo_timing_enabled":0}
         options=[]
         for key,value in controls.items(): options.extend(("--"+key.replace("_","-"),value))
         for model in models:
@@ -525,6 +562,54 @@ class RendererContract(unittest.TestCase):
         metadata=json.loads(Path(str(self.output)+".json").read_text())
         self.assertEqual(metadata["controls"]["mod1_destination"],8)
         self.assertEqual(metadata["controls"]["modulation_enabled"],False)
+
+    def test_swell_factory_recipe_omits_dry_attack_and_rises(self):
+        write_wave(self.input,[.4*math.sin(2*math.pi*220*n/8000) for n in range(32000)])
+        profile=Path(__file__).resolve().parents[1]/"models/presets/swell.profile"
+        self.run_renderer("--profile",profile,"--tail",0)
+        metadata=json.loads(Path(str(self.output)+".json").read_text())
+        self.assertEqual(metadata["parameters"]["model"],"autovolume")
+        self.assertEqual(metadata["parameters"]["mix"],1)
+        self.assertEqual(metadata["controls"]["swell_ms"],1200)
+        self.assertFalse(metadata["controls"]["modulation_enabled"])
+        self.assertEqual(metadata["rhythm"]["effective_left_ms"],500)
+        wet=read_float(self.output)[::2]
+        self.assertTrue(all(sample==0 for sample in wet[:4000]))
+        early=sum(abs(sample) for sample in wet[4000:4800])/800
+        late=sum(abs(sample) for sample in wet[20000:24000])/4000
+        self.assertGreater(early,0)
+        self.assertGreater(late,early*2)
+        self.assertLessEqual(max(abs(sample) for sample in wet),CEILING+1e-6)
+
+    def test_factory_envelopes_release_the_existing_stereo_tail(self):
+        # Left stops first. The right input must keep the shared duck active;
+        # afterward even a nonzero input below threshold must release it.
+        fs=8000
+        samples=[]
+        for n in range(fs*2):
+            samples.extend((.35*math.sin(2*math.pi*220*n/fs) if n<fs*.4 else 0,
+                            (.7 if n<fs else .004)*math.sin(2*math.pi*440*n/fs)))
+        write_wave(self.input,samples,channels=2,fs=fs)
+        def rms(wet,start,end):
+            window=wet[int(start*fs):int(end*fs)]
+            return math.sqrt(sum(v*v for v in window)/len(window))
+        for recipe in ("ducked_voice","bloom","swell"):
+            with self.subTest(recipe=recipe):
+                profile=Path(__file__).resolve().parents[1]/f"models/presets/{recipe}.profile"
+                args=("--profile",profile,"--mix",1,"--tail",.5)
+                self.run_renderer(*args,neutral=False)
+                wet=read_float(self.output)[::2]
+                self.run_renderer(*args,"--duck-amount",0,neutral=False)
+                unducked=read_float(self.output)[::2]
+                during=rms(wet,.7,.8)/rms(unducked,.7,.8)
+                recovering=rms(wet,1.3,1.4)/rms(unducked,1.3,1.4)
+                recovered=rms(wet,1.8,1.9)/rms(unducked,1.8,1.9)
+                self.assertLess(during,.3)
+                self.assertGreater(recovering,.45)
+                self.assertGreater(recovered,.8)
+                self.assertGreater(recovering,during*2)
+                self.assertGreater(rms(unducked,1.3,1.4),1e-7)
+                self.assertTrue(all(math.isfinite(v) and abs(v)<=CEILING+1e-6 for v in wet))
 
     def test_autovolume_can_produce_a_clear_wet_swell(self):
         write_wave(self.input,[.4]*8000)

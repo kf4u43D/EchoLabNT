@@ -1,23 +1,23 @@
-# Platter Motion
-# A moving disc-style echo with a dense, rounded repeat.
-# Quarter-note repeats with driven platter colour, 1 Hz modulation and 6 ms depth.
+# Swell
+# Slow pad-like entrances with longer echo space.
+# A 1200 ms rising wet envelope with quarter-note echoes; the stored tail is released after the phrase.
 sync_mode=internal
 tempo_bpm=120
 division=1/4
 right_division=ratio
-model=platter
-feedback=0.18
-mix=0.39
-tone_hz=3200
-drive=0.4
+model=autovolume
+feedback=0.28
+mix=1
+tone_hz=4200
+drive=0
 bit_depth=8
 mod_rate_hz=1
-mod_depth_ms=6
-duck_threshold_db=-24
+mod_depth_ms=0
+duck_threshold_db=-40
 duck_amount=0.9
-attack_ms=5
-release_ms=250
-swell_ms=250
+attack_ms=2
+release_ms=500
+swell_ms=1200
 stereo_ratio=1.5
 loop_action=record
 limiter_enabled=1
@@ -34,14 +34,15 @@ mod2_source=0
 mod2_destination=0
 mod2_amount=0
 feedback_lowpass_hz=12000
-drift_amount=0.25
+drift_amount=0
 feedback_highpass_hz=80
 lores_rate_end_hz=1200
 lores_rate_decay_ms=1500
 lores_rate_envelope_amount=1
 digital_rack_rate_hz=16000
 lores_cutoff_hz=2000
-voicing=a04
-modulation_enabled=1
+voicing=a05
+modulation_enabled=0
 exciter_highpass_enabled=0
-wet_tone_enabled=0
+wet_tone_enabled=1
+stereo_timing_enabled=0

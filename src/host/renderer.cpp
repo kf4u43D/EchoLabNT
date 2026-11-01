@@ -83,9 +83,10 @@ void assign(Parameters& p, const std::string& key, const std::string& value,echo
     }
     if(key=="mod1_source" || key=="mod2_source" || key=="mod1_destination" || key=="mod2_destination") {
         const char* sources[]={"none","lfo","envelope","cv1","cv2","wheel"};
-        const char* destinations[]={"none","time","feedback","tone","drive","mix","depth","exciter","sample_rate"};
+        const char* destinations[]={"none","time","feedback","tone","drive","mix","depth","exciter","sample_rate",
+                                    "mod_rate","stereo_ratio","drift","duck_amount"};
         const bool source=key.find("source")!=std::string::npos;
-        const int count=source?6:9;
+        const int count=source?6:echolab::modulationDestinationCount;
         int selected=-1;
         for(int i=0;i<count;++i) if(value==(source?sources[i]:destinations[i])) selected=i;
         if(!source && value=="fe") selected=8;
@@ -153,6 +154,7 @@ void assign(Parameters& p, const std::string& key, const std::string& value,echo
         if(key=="exciter_highpass_enabled") p.exciter_highpass_enabled=parsed!=0;else p.wet_tone_enabled=parsed!=0;
     }
     else if (key == "modulation_enabled") {if(parsed!=0 && parsed!=1)throw std::runtime_error("modulation_enabled must be 0 or 1");p.modulation_enabled=parsed!=0;}
+    else if (key == "stereo_timing_enabled") {if(parsed!=0 && parsed!=1)throw std::runtime_error("stereo_timing_enabled must be 0 or 1");p.stereo_timing_enabled=parsed!=0;}
     else if (key == "tap_pattern") {if(parsed<0 || parsed>=echolab::multitap::patternCount || std::floor(parsed)!=parsed)throw std::runtime_error("tap_pattern must be an integer 0.."+std::to_string(echolab::multitap::patternCount-1));p.tap_pattern=static_cast<int>(parsed);}
     else if (key == "mod1_amount" || key == "mod2_amount") {if(parsed<-1 || parsed>1)throw std::runtime_error("modulation amount must be -1..1");if(key=="mod1_amount")p.mod1_amount=parsed;else p.mod2_amount=parsed;}
     else throw std::runtime_error("Unknown parameter: " + key);
@@ -261,6 +263,8 @@ void help() {
         "  --tap-pattern N               0.." << echolab::multitap::patternCount-1 << ", multitap rhythms\n"
         "  --mod1-source NAME            none|lfo|envelope|cv1|cv2|wheel (also mod2)\n"
         "  --mod1-destination NAME       none|time|feedback|tone|drive|mix|depth|exciter|sample_rate (fe)\n"
+        "                                mod_rate|stereo_ratio|drift|duck_amount (also mod2)\n"
+        "  --stereo-timing-enabled N     0|1; independent L/R on Analog, Tube, Tape and Analog Mod\n"
         "  --mod1-amount N               -1..1 (also mod2 destination/amount)\n"
         "  --cv1-input file.wav          normalized CV, +/-1 maps to +/-5V; also --cv2-input\n"
         "Events may set normalized cv1, cv2, wheel as well as effect parameters.\n"
@@ -423,10 +427,10 @@ int main(int argc, char** argv) {
             << ", \"right_division\": " << json(initialTiming.rightDivision<0 ? "ratio" : echolab::host::divisionName(initialTiming.rightDivision))
             << ", \"requested_left_ms\": " << initialTiming.requestedLeftMs()
             << ", \"effective_left_ms\": " << initial.delay_ms
-            << ", \"requested_right_ms\": " << (initial.model==echolab::Model::StereoDelays ? initialTiming.requestedRightMs() : initialTiming.requestedLeftMs())
-            << ", \"effective_right_ms\": " << (initial.model==echolab::Model::StereoDelays ? std::min(maxDelayMs,initial.delay_ms*initial.stereo_ratio) : initial.delay_ms)
+            << ", \"requested_right_ms\": " << (echolab::stereoTimingActive(initial) ? initialTiming.requestedRightMs() : initialTiming.requestedLeftMs())
+            << ", \"effective_right_ms\": " << (echolab::stereoTimingActive(initial) ? std::min(maxDelayMs,initial.delay_ms*initial.stereo_ratio) : initial.delay_ms)
             << ", \"left_clipped\": " << (std::fabs(initialTiming.requestedLeftMs()-initial.delay_ms)>.001 ? "true" : "false")
-            << ", \"right_clipped\": " << (initial.model==echolab::Model::StereoDelays && std::fabs(initialTiming.requestedRightMs()-std::min(maxDelayMs,initial.delay_ms*initial.stereo_ratio))>.001 ? "true" : "false") << "}"
+            << ", \"right_clipped\": " << (echolab::stereoTimingActive(initial) && std::fabs(initialTiming.requestedRightMs()-std::min(maxDelayMs,initial.delay_ms*initial.stereo_ratio))>.001 ? "true" : "false") << "}"
             << ",\n  \"resolved_voicing\": " << json(echolab::voicingName(echolab::resolvedVoicing(initial.model,initial.voicing)))
             << ",\n  \"parameters\": {\"model\": " << json(echolab::modelName(initial.model))
             << ", \"delay_ms\": " << initial.delay_ms << ", \"feedback\": " << initial.feedback
@@ -436,6 +440,7 @@ int main(int argc, char** argv) {
             << ", \"duck_amount\": " << initial.duck_amount << ", \"attack_ms\": " << initial.attack_ms
             << ", \"release_ms\": " << initial.release_ms << ", \"swell_ms\": " << initial.swell_ms
             << ", \"stereo_ratio\": " << initial.stereo_ratio << ", \"loop_action\": " << initial.loop_action
+            << ", \"stereo_timing_enabled\": " << (initial.stereo_timing_enabled ? "true" : "false")
             << ", \"limiter_enabled\": " << (initial.limiter_enabled?"true":"false") << ", \"limiter_ceiling\": " << initial.limiter_ceiling
             << ", \"limiter_release_ms\": " << initial.limiter_release_ms << ", \"sample_rate_hz\": " << initial.sample_rate_hz
             << ", \"digital_rack_rate_hz\": " << initial.digital_rack_rate_hz

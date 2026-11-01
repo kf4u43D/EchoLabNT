@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CEILING = 10 ** (-1 / 20)
 THRESHOLD = 10 ** (-60 / 20)
 HIGH_DRIVE = {"analog_bounce": "analog", "tape_space": "tape", "tube_slap": "tube",
-              "platter_motion": "platter"}
+              "platter": "platter"}
 
 
 def digest(path: Path) -> str:

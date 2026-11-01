@@ -68,6 +68,99 @@ void impulseAndInterpolation() {
         near(l,i == 16 ? 0.5f : 0,2e-6f,"maximum delay reaches final legal tap");
     }
 }
+void colouredStereoTiming() {
+    const echolab::Model models[]={echolab::Model::Analog,echolab::Model::AnalogMod,
+        echolab::Model::Tube,echolab::Model::TubeA04,echolab::Model::Tape};
+    for (auto model:models) for (bool enabled:{false,true}) {
+        Fixture f(8000,6);
+        auto p=neutralParameters();p.model=model;p.delay_ms=3;p.feedback=0;p.mix=1;
+        p.modulation_enabled=false;p.stereo_timing_enabled=enabled;p.stereo_ratio=2.0f/3.0f;
+        f.engine.setParameters(p);f.engine.reset();
+        const unsigned rightStart=enabled?16:24;
+        for(unsigned sample=0;sample<32;++sample) {
+            float left,right;
+            f.engine.processSample(sample==0?.125f:0,sample==0?.125f:0,left,right);
+            if(sample<24) near(left,0,0,"coloured left echo waits for its configured time");
+            if(sample<rightStart) near(right,0,0,"coloured right echo waits for its independent time");
+            if(sample==24) check(std::fabs(left)>1e-8f,"coloured left first arrival is audible");
+            if(sample==rightStart) check(std::fabs(right)>1e-8f,"coloured right first arrival follows stereo timing toggle");
+        }
+        p.stereo_timing_enabled=true;p.delay_ms=3;p.stereo_ratio=24;
+        f.engine.setParameters(p);f.engine.reset();
+        for(unsigned sample=0;sample<=48;++sample) {
+            float left,right;f.engine.processSample(0,sample==0?.125f:0,left,right);
+            near(left,0,0,"independent coloured feedback does not copy right excitation to left");
+            if(sample<48) near(right,0,0,"right time clamps independently to allocated capacity");
+            if(sample==48) check(std::fabs(right)>1e-8f,"right clipped tap reaches final legal delay");
+        }
+    }
+    // Off preserves the existing coloured sound even if a saved ratio differs.
+    Fixture a(8000,20),b(8000,20);
+    auto p=neutralParameters();p.model=echolab::Model::Tape;p.modulation_enabled=true;p.delay_ms=8;p.feedback=.3f;
+    p.stereo_ratio=.5f;a.engine.setParameters(p);a.engine.reset();
+    p.stereo_ratio=2;b.engine.setParameters(p);b.engine.reset();
+    for(unsigned sample=0;sample<1000;++sample) {
+        float al,ar,bl,br;const float input=sample%47==0?.2f:0;
+        a.engine.processSample(input,-input,al,ar);b.engine.processSample(input,-input,bl,br);
+        near(al,bl,0,"disabled coloured stereo timing retains legacy left output");
+        near(ar,br,0,"disabled coloured stereo timing ignores stored ratio");
+    }
+}
+void extendedModulationRoutes() {
+    for(int destination=9;destination<echolab::modulationDestinationCount;++destination) {
+        Fixture mapped(8000,30),direct(8000,30);
+        auto p=neutralParameters();p.model=echolab::Model::AnalogMod;p.delay_ms=10;p.feedback=.25f;
+        p.mix=1;p.mod_rate_hz=1;p.mod_depth_ms=1;p.modulation_enabled=true;p.drift_amount=0;
+        if(destination==10) {p.model=echolab::Model::Analog;p.stereo_timing_enabled=true;p.stereo_ratio=1.5f;}
+        if(destination==11) {p.model=echolab::Model::Tape;p.drift_amount=.2f;}
+        if(destination==12) {p.model=echolab::Model::Dynamic;p.duck_amount=.4f;p.duck_threshold_db=-35;}
+        p.mod1_source=3;p.mod1_destination=destination;p.mod1_amount=.2f;
+        mapped.engine.setParameters(p);mapped.engine.reset();mapped.engine.setExternalModulation(.5f,0,0);
+        p.mod1_destination=0;
+        const float route=.5f*.2f;
+        if(destination==9) p.mod_rate_hz+=20*route;
+        if(destination==10) p.stereo_ratio*=1+.75f*route;
+        if(destination==11) p.drift_amount+=route;
+        if(destination==12) p.duck_amount+=route;
+        direct.engine.setParameters(p);direct.engine.reset();
+        for(unsigned sample=0;sample<4000;++sample) {
+            const float input=sample%71<10?.125f:0;
+            float ml,mr,dl,dr;
+            mapped.engine.processSample(input,-input,ml,mr);direct.engine.processSample(input,-input,dl,dr);
+            near(ml,dl,2e-6f,"new CV destination matches equivalent direct left control");
+            near(mr,dr,2e-6f,"new CV destination matches equivalent direct right control");
+        }
+        // Exercise both route sums and endpoints without allocations or nonfinites.
+        p.mod1_destination=destination;p.mod2_source=4;p.mod2_destination=destination;
+        p.mod1_amount=p.mod2_amount=1;
+        mapped.engine.setParameters(p);mapped.engine.reset();audioGuard=true;
+        bool finite=true;
+        for(unsigned sample=0;sample<1000;++sample) {
+            const float cv=sample%2?1.0f:-1.0f;mapped.engine.setExternalModulation(cv,cv,0);
+            float left,right;mapped.engine.processSample(.1f,-.1f,left,right);
+            finite=finite && std::isfinite(left) && std::isfinite(right);
+        }
+        audioGuard=false;check(finite,"new CV route endpoints remain finite");
+    }
+}
+void savedDriftRouteIsInactiveOnLooper() {
+    Fixture mapped(8000,30),plain(8000,30);
+    auto p=neutralParameters();p.model=echolab::Model::LoopSampler;p.loop_action=1;p.delay_ms=10;
+    p.feedback=.7f;p.drive=.3f;p.modulation_enabled=true;p.drift_amount=.25f;p.mix=1;
+    p.mod1_source=3;p.mod1_destination=11;p.mod1_amount=1;
+    mapped.engine.setParameters(p);mapped.engine.reset();mapped.engine.setExternalModulation(1,0,0);
+    p.mod1_destination=0;plain.engine.setParameters(p);plain.engine.reset();
+    for(unsigned sample=0;sample<1000;++sample) {
+        if(sample==100) {
+            p.loop_action=3;plain.engine.setParameters(p);
+            p.mod1_destination=11;mapped.engine.setParameters(p);
+        }
+        const float input=sample%19<3?.125f:0;
+        float ml,mr,pl,pr;mapped.engine.processSample(input,-input,ml,mr);plain.engine.processSample(input,-input,pl,pr);
+        near(ml,pl,0,"saved inactive Drift route preserves looper left record/overdub");
+        near(mr,pr,0,"saved inactive Drift route preserves looper right record/overdub");
+    }
+}
 void exact48kLongDelay() {
     Fixture f(48000,250);
     f.parameters(250,0.55f);
@@ -989,13 +1082,13 @@ void dynamicDuckingAndRecovery() {
     duck.engine.setParameters(p);duck.engine.reset();
     p.model=echolab::Model::Digital;plain.engine.setParameters(p);plain.engine.reset();
     bool attenuated=false,recovered=false;
-    for (unsigned n=0;n<3200;++n) {
+    for (unsigned n=0;n<4800;++n) {
         const float inL=n == 0 ? 0.5f : 0.0f;
         const float inR=n < 1600 ? 0.15f : 0.0f;
         float dl,dr,pl,pr;
         duck.engine.processSample(inL,inR,dl,dr);plain.engine.processSample(inL,inR,pl,pr);
         if (n == 800) { check(pl > 0 && dl/pl < 0.3f,"stereo detector ducks an existing left tail during sustained right input");attenuated=true; }
-        if (n == 2400) { check(pl > 0 && dl == pl && dr == pr,"ducking recovers to the unchanged feedback tail after detector release");recovered=true; }
+        if (n == 4000) { check(pl > 0 && dl == pl && dr == pr,"ducking settles to the unchanged feedback tail after gain release");recovered=true; }
     }
     check(attenuated && recovered,"ducking test observes both active and recovered wet states");
     p.model=echolab::Model::Dynamic;p.mix=0;duck.engine.setParameters(p);duck.engine.reset();
@@ -1007,7 +1100,7 @@ void dynamicDuckingAndRecovery() {
 void automaticVolumeSwell() {
     Fixture f;
     auto p=f.engine.parameters();p.model=echolab::Model::AutoVolume;p.delay_ms=1;p.feedback=0;p.mix=1;
-    p.attack_ms=.1f;p.release_ms=10;p.swell_ms=50;p.duck_threshold_db=-40;
+    p.attack_ms=.1f;p.release_ms=10;p.swell_ms=50;p.duck_threshold_db=-40;p.duck_amount=0;
     f.engine.setParameters(p);f.engine.reset();
     float early=0,late=0,retrigger=0;
     for (unsigned n=0;n<2400;++n) {
@@ -1015,13 +1108,100 @@ void automaticVolumeSwell() {
         float l,r;f.engine.processSample(input,input,l,r);
         if (n == 8) early=l;
         if (n == 1000) late=l;
-        if (n == 2208) retrigger=l;
+        if (n == 2240) retrigger=l;
     }
-    check(early > 0 && early < .005f && late > .45f,"AutoVolume ramps wet excitation over the configured swell time");
-    near(retrigger,early,1e-7f,"AutoVolume retriggers its swell after a sufficiently quiet gap");
+    const float expectedEarly=.5f*(1.0f-std::exp(-9.0f/(.050f*8000.0f)));
+    near(early,expectedEarly,2e-6f,"AutoVolume applies the prepared swell time constant to its wet return");
+    check(early > 0 && early < .02f && late > .45f,"AutoVolume starts softly and rises toward the full wet return");
+    const float expectedRetrigger=.5f*(1.0f-std::exp(-41.0f/(.050f*8000.0f)));
+    near(retrigger,expectedRetrigger,3e-6f,"AutoVolume rearms the next phrase without resetting the stored delay");
     p.mix=0;f.engine.setParameters(p);f.engine.reset();
     float l,r;f.engine.processSample(.5f,-.25f,l,r);
     check(l == .5f && r == -.25f,"AutoVolume leaves the dry input unchanged");
+}
+
+void factoryEnvelopeTailRecovery() {
+    constexpr unsigned fs=48000;
+    struct Recipe { echolab::Model model; float delay,feedback,mix,tone,attack,release,threshold,swell; int voicing; bool moving; };
+    const Recipe recipes[]={
+        {echolab::Model::Dynamic,500,.28f,.39f,4800,5,200,-30,250,3,true},
+        {echolab::Model::AutoVolume,125,.22f,1,4400,2,500,-40,600,2,true},
+        {echolab::Model::AutoVolume,500,.28f,1,4200,2,500,-40,1200,2,false},
+    };
+    for(const auto& recipe:recipes) {
+        Fixture duck(fs,1500),oracle(fs,1500);
+        echolab::Parameters p;
+        p.model=recipe.model;p.delay_ms=recipe.delay;p.feedback=recipe.feedback;p.mix=recipe.mix;
+        p.tone_hz=recipe.tone;p.drive=0;p.attack_ms=recipe.attack;p.release_ms=recipe.release;
+        p.duck_threshold_db=recipe.threshold;p.duck_amount=.9f;p.swell_ms=recipe.swell;
+        p.voicing=recipe.voicing;p.modulation_enabled=recipe.moving;p.wet_tone_enabled=true;
+        p.drift_amount=recipe.moving?.25f:0;p.mod_depth_ms=recipe.moving?6.0f:0;
+        duck.engine.setParameters(p);duck.engine.reset();
+        p.duck_amount=0;oracle.engine.setParameters(p);oracle.engine.reset();
+        double wetPower[4]{},oraclePower[4]{};
+        const float starts[]={.7f,1.1f,1.3f,1.8f};
+        const float stops[]={.8f,1.2f,1.4f,1.9f};
+        for(unsigned n=0;n<2*fs;++n) {
+            const float time=static_cast<float>(n)/fs;
+            const float inputL=n<2*fs/5?.35f*std::sin(6.2831853071795864769f*220*time):0;
+            // The right input holds down a real left-channel tail, then falls
+            // to -48 dBFS, below each factory threshold, instead of exact zero.
+            const float inputR=(n<fs?.7f:.004f)*std::sin(6.2831853071795864769f*440*time);
+            float dl,dr,ol,orr;
+            duck.engine.processSample(inputL,inputR,dl,dr);
+            oracle.engine.processSample(inputL,inputR,ol,orr);
+            check(std::isfinite(dl) && std::isfinite(dr),"factory envelope outputs remain finite");
+            for(unsigned window=0;window<4;++window)
+                if(n>=static_cast<unsigned>(starts[window]*fs) && n<static_cast<unsigned>(stops[window]*fs)) {
+                    wetPower[window]+=static_cast<double>(dl)*dl;
+                    oraclePower[window]+=static_cast<double>(ol)*ol;
+                }
+        }
+        float ratio[4]{};
+        for(unsigned window=0;window<4;++window) {
+            check(oraclePower[window]>0,"factory tail gain is compared only with a nonzero oracle return");
+            ratio[window]=static_cast<float>(std::sqrt(wetPower[window]/oraclePower[window]));
+            check(ratio[window]<=1.02f,"wet gain recovery does not boost the stored tail above its oracle");
+        }
+        check(ratio[0]<.3f,"Ducked Voice, Bloom and Swell attenuate an existing tail while either input plays");
+        check(ratio[2]>.45f && ratio[2]>2*ratio[0],"factory wet tails rise within 300-400 ms after input falls below threshold");
+        check(ratio[3]>.8f,"factory tails approach their unducked oracle despite a below-threshold noise floor");
+        if(recipe.model==echolab::Model::Dynamic)
+            check(ratio[1]>.5f && ratio[2]>.8f,"200 ms Dynamic release acts on gain without a preceding level-decay wait");
+    }
+}
+
+void swellPreservesStoredTailAndSmoothRetrigger() {
+    constexpr unsigned fs=48000;
+    Fixture swell(fs,2000),oracle(fs,2000);
+    echolab::Parameters p;
+    p.model=echolab::Model::AutoVolume;p.delay_ms=500;p.feedback=.28f;p.mix=1;
+    p.tone_hz=4200;p.drive=0;p.voicing=2;p.attack_ms=2;p.release_ms=500;
+    p.duck_threshold_db=-40;p.duck_amount=0;p.swell_ms=1200;p.wet_tone_enabled=true;
+    p.modulation_enabled=false;p.mod_depth_ms=0;p.drift_amount=0;
+    swell.engine.setParameters(p);swell.engine.reset();
+    auto full=p;full.swell_ms=1;oracle.engine.setParameters(full);oracle.engine.reset();
+    double tailPower=0,fullPower=0;
+    for(unsigned n=0;n<2*fs;++n) {
+        if(n==5*fs/4) {p.swell_ms=1;swell.engine.setParameters(p);}
+        const float input=n<fs/10?.25f*std::sin(6.2831853071795864769f*220*static_cast<float>(n)/fs):0;
+        float sl,sr,ol,orr;swell.engine.processSample(input,input,sl,sr);oracle.engine.processSample(input,input,ol,orr);
+        if(n<fs/2) near(sl,0,0,"a short Swell phrase has no dry attack before its actual 500 ms delay");
+        if(n>=3*fs/2 && n<8*fs/5) {tailPower+=static_cast<double>(sl)*sl;fullPower+=static_cast<double>(ol)*ol;}
+    }
+    check(fullPower>1e-8 && std::sqrt(tailPower/fullPower)>.999,"Swell keeps the complete short-phrase feedback tail independently of its earlier envelope gain");
+
+    p.swell_ms=50;p.release_ms=10;p.wet_tone_enabled=false;
+    swell.engine.setParameters(p);swell.engine.reset();
+    float previous=0;float largestDrop=0;
+    for(unsigned n=0;n<8*fs/5;++n) {
+        const float input=n<fs || n>=7*fs/5?.4f:0;
+        float sl,sr;swell.engine.processSample(input,input,sl,sr);
+        if(n>=7*fs/5 && n<7*fs/5+fs/100)
+            largestDrop=std::max(largestDrop,previous-sl);
+        previous=sl;
+    }
+    check(largestDrop<.01f,"retriggered Swell lowers an audible old return with Attack smoothing rather than an abrupt gate");
 }
 void sharedMemoryCanariesAndModelChanges() {
     const auto required=echolab::Engine::requiredSamples(8000,3);
@@ -1208,8 +1388,9 @@ void operator delete(void* ptr,std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr,std::size_t) noexcept { std::free(ptr); }
 
 int main() {
-    impulseAndInterpolation(); exact48kLongDelay(); stereoMusicalRatios(); stereoThreeAgainstTwoMusicalTiming(); pingPongTopology(); multiHeadTopology();
-    lowResolutionQuantization();dynamicDuckingAndRecovery();automaticVolumeSwell();sharedMemoryCanariesAndModelChanges();
+    impulseAndInterpolation(); exact48kLongDelay(); stereoMusicalRatios(); stereoThreeAgainstTwoMusicalTiming(); colouredStereoTiming(); extendedModulationRoutes(); savedDriftRouteIsInactiveOnLooper(); pingPongTopology(); multiHeadTopology();
+    lowResolutionQuantization();dynamicDuckingAndRecovery();automaticVolumeSwell();factoryEnvelopeTailRecovery();
+    swellPreservesStoredTailAndSmoothRetrigger();sharedMemoryCanariesAndModelChanges();
     fractionalSampleRateReduction();decliningLoResPhraseEnvelope();oneWaySweepDirections();sweepFilterSpectra();feedbackAboveUnityAndLimiter();exciterInFeedbackOnly();optionalExciterHighpass();selectableHeadPattern();polyrhythmPulseGrids();optionalWetTone();liveLooperRecordUsesConfiguredTime();externalModulationRouting();
     feedbackLowpassPlacementAndSlope();feedbackHighpassPlacementAndSlope();rackRateIsModelSpecific();selectedVoicingsAndLegacyFeedback();optionalModulationAndLoResRateRoute();platterModulationOffRemovesDepthOffset();colourCompensationAndSlowDrift();
     memoryAndReset(); eventAndBlockInvariance(); ratesExtremesAndAllocations();

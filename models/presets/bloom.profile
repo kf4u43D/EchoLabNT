@@ -1,6 +1,6 @@
 # Bloom
 # A fully wet swell for soft entrances and pads.
-# A slow volume rise feeds short sixteenth-note echoes.
+# A rising wet envelope with short sixteenth-note echoes; the stored tail is released after the phrase.
 sync_mode=internal
 tempo_bpm=120
 division=1/16
@@ -45,3 +45,4 @@ voicing=a05
 modulation_enabled=1
 exciter_highpass_enabled=0
 wet_tone_enabled=1
+stereo_timing_enabled=0

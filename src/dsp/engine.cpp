@@ -115,6 +115,7 @@ void Engine::setParameters(const Parameters& p) noexcept {
     target_.modulation_enabled=p.modulation_enabled;
     target_.exciter_highpass_enabled=p.exciter_highpass_enabled;
     target_.wet_tone_enabled=p.wet_tone_enabled;
+    target_.stereo_timing_enabled=p.stereo_timing_enabled;
     voicing_=resolvedVoicing(target_.model,target_.voicing);
     target_.bit_depth=std::max(4,std::min(24,p.bit_depth));
     target_.mod_rate_hz=bounded(p.mod_rate_hz,0.01f,20.0f,1.0f);
@@ -134,10 +135,10 @@ void Engine::setParameters(const Parameters& p) noexcept {
     target_.exciter_tune_hz=bounded(p.exciter_tune_hz,200.0f,std::min(10000.0f,0.4f*sampleRate_),4000.0f);
     target_.tap_pattern=std::max(0,std::min(static_cast<int>(multitap::patternCount)-1,p.tap_pattern));
     target_.mod1_source=std::max(0,std::min(5,p.mod1_source));
-    target_.mod1_destination=std::max(0,std::min(8,p.mod1_destination));
+    target_.mod1_destination=std::max(0,std::min(modulationDestinationCount-1,p.mod1_destination));
     target_.mod1_amount=bounded(p.mod1_amount,-1.0f,1.0f,0.0f);
     target_.mod2_source=std::max(0,std::min(5,p.mod2_source));
-    target_.mod2_destination=std::max(0,std::min(8,p.mod2_destination));
+    target_.mod2_destination=std::max(0,std::min(modulationDestinationCount-1,p.mod2_destination));
     target_.mod2_amount=bounded(p.mod2_amount,-1.0f,1.0f,0.0f);
     target_.feedback_lowpass_hz=p.feedback_lowpass_hz == 0 ? 0 : bounded(p.feedback_lowpass_hz,20.0f,20000.0f,12000.0f);
     target_.drift_amount=bounded(p.drift_amount,0.0f,1.0f,0.25f);
@@ -179,7 +180,7 @@ void Engine::setParameters(const Parameters& p) noexcept {
         // Invalidate module state in bounded time; shared audio storage is not cleared.
         reverse_.reset();looper_.reset();rack_.reset();exciter_.reset();saturator_.reset();feedbackLowpass_.reset();
         loresPhase_=1.0f;loresHeld_[0]=loresHeld_[1]=0.0f;
-        modPhase_=flutterPhase_=detector_=swellGain_=0.0f;swellGate_=false;
+        modPhase_=flutterPhase_=detector_=swellGain_=swellTarget_=0.0f;swellGate_=false;duckGain_=1.0f;
         for (unsigned c=0;c<2;++c) extraFilter1_[c]=extraFilter2_[c]=wetTone_[c]=0.0f;
         driftPhase_[0]=0.17f;driftPhase_[1]=0.43f;driftPhase_[2]=0.71f;
         a04Color_.reset();tubeColor_.reset();regenerator_.reset();
@@ -211,7 +212,7 @@ void Engine::reset() noexcept {
     drive_ = target_.drive;
     tonePole_ = toneTarget_;
     phase_ = 0.0f;
-    modPhase_=flutterPhase_=detector_=swellGain_=0.0f;swellGate_=false;
+    modPhase_=flutterPhase_=detector_=swellGain_=swellTarget_=0.0f;swellGate_=false;duckGain_=1.0f;
     modRate_=target_.mod_rate_hz;modDepth_=modDepthTarget_;
     duckThreshold_=duckThresholdTarget_;duckAmount_=target_.duck_amount;
     driftAmount_=target_.drift_amount;driftPhase_[0]=0.17f;driftPhase_[1]=0.43f;driftPhase_[2]=0.71f;
@@ -270,9 +271,7 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         }
     }
     const bool moving=target_.modulation_enabled;
-    const float drift=target_.model == Model::Digital || voicing_ == 1 || !moving ? 0.0f : driftAmount_;
     const bool looper=target_.model == Model::LoopSampler;
-    const float playbackDrift=looper ? 0.0f : drift;
     const float modulation=moving ? 4.0f*std::fabs(modPhase_-0.5f)-1.0f : 0.0f;
     const float flutter=moving ? 4.0f*std::fabs(flutterPhase_-0.5f)-1.0f : 0.0f;
     if (target_.model == Model::LoRes || target_.model == Model::Sweep || target_.model == Model::SweepUp) {
@@ -287,28 +286,46 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         if (phraseGate_ && phraseEnvelope_ < 0.005f) phraseGate_=false;
     }
     float wetGain=1.0f;
-    float excitationGain=1.0f;
     const bool envelopeRoute=(target_.mod1_source == 2 && target_.mod1_destination && target_.mod1_amount != 0) ||
         (target_.mod2_source == 2 && target_.mod2_destination && target_.mod2_amount != 0);
     if (target_.model == Model::Dynamic || target_.model == Model::AutoVolume || envelopeRoute) {
         const float level=std::max(std::fabs(input[0]),std::fabs(input[1]));
         const float detectorPole=level > detector_ ? detectorAttackPole_ : detectorReleasePole_;
         detector_=level+detectorPole*(detector_-level);
-        if (target_.model == Model::Dynamic) {
-            if (detector_ > duckThreshold_)
-                wetGain=1.0f-duckAmount_*(1.0f-duckThreshold_/detector_);
-        } else if (target_.model == Model::AutoVolume) {
-            if (!swellGate_ && detector_ >= duckThreshold_) { swellGate_=true;swellGain_=0.0f; }
-            if (swellGate_ && detector_ < 0.5f*duckThreshold_) { swellGate_=false;swellGain_=0.0f; }
-            if (swellGate_) swellGain_+=swellSlew_*(1.0f-swellGain_);
-            excitationGain=swellGate_ ? swellGain_ : 0.0f;
+        if (target_.model == Model::AutoVolume) {
+            if (!swellGate_ && detector_ >= duckThreshold_) { swellGate_=true;swellTarget_=0.0f; }
+            // Quiet input rearms the next phrase but never gates the stored tail.
+            // Continue the current ramp after release; a retrigger lowers its
+            // target with Attack smoothing rather than cutting existing echoes.
+            if (swellGate_ && detector_ < 0.5f*duckThreshold_) swellGate_=false;
+            if (swellGate_ || swellTarget_ > 0.0f)
+                swellTarget_+=swellSlew_*(1.0f-swellTarget_);
+            if (swellTarget_ < swellGain_)
+                swellGain_=swellTarget_+detectorAttackPole_*(swellGain_-swellTarget_);
+            else swellGain_=swellTarget_;
         }
     }
     const float sources[6]={0.0f,modulation,moving ? bounded(detector_,0.0f,1.0f,0.0f) : 0.0f,externalMod_[0],externalMod_[1],externalMod_[2]};
-    float routed[9]{};
+    float routed[modulationDestinationCount]{};
     routed[target_.mod1_destination]+=sources[target_.mod1_source]*target_.mod1_amount;
     routed[target_.mod2_destination]+=sources[target_.mod2_source]*target_.mod2_amount;
-    for (unsigned destination=1;destination<9;++destination) routed[destination]=bounded(routed[destination],-1.0f,1.0f,0.0f);
+    for (unsigned destination=1;destination<modulationDestinationCount;++destination) routed[destination]=bounded(routed[destination],-1.0f,1.0f,0.0f);
+    const float routedDrift=bounded(driftAmount_+(looper?0.0f:routed[11]),0.0f,1.0f,driftAmount_);
+    const float drift=target_.model == Model::Digital || voicing_ == 1 || !moving ? 0.0f : routedDrift;
+    const float playbackDrift=looper ? 0.0f : drift;
+    const float stereoRatio=bounded(target_.stereo_ratio*(1.0f+0.75f*routed[10]),1.0f/24.0f,24.0f,target_.stereo_ratio);
+    if (target_.model == Model::Dynamic || target_.model == Model::AutoVolume) {
+        const float amount=bounded(duckAmount_+routed[12],0.0f,1.0f,duckAmount_);
+        const float level=std::max(std::fabs(input[0]),std::fabs(input[1]));
+        const float targetGain=level > duckThreshold_ ? 1.0f-amount*(1.0f-duckThreshold_/level) : 1.0f;
+        // Attack/Release act on wet gain directly. A loud preceding phrase must
+        // not add an amplitude-dependent wait before the quiet tail can return.
+        const float pole=targetGain < duckGain_ ? detectorAttackPole_ : detectorReleasePole_;
+        duckGain_=targetGain+pole*(duckGain_-targetGain);
+        if (targetGain == 1.0f && duckGain_ > 0.99999f) duckGain_=1.0f;
+        wetGain=amount == 0.0f ? 1.0f : bounded(duckGain_,0.0f,1.0f,1.0f);
+        if (target_.model == Model::AutoVolume) wetGain*=swellGain_;
+    }
     const float delay=bounded(delay_*(1.0f+0.5f*routed[1])+sampleRate_*0.0001f*playbackDrift*driftWave[0],1.0f,maximumSamples_,delay_);
     const float feedback=bounded((feedback_+0.5f*routed[2])*(1.0f+0.003f*drift*driftWave[1]),0.0f,2.0f,feedback_);
     const float routedTonePole=routed[3] >= 0 ? tonePole_+routed[3]*(toneHighPole_-tonePole_) :
@@ -327,7 +344,8 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         return finiteSignal((1.0f-mix)*input[channel]+mix*wet);
     };
     const float modDepth=bounded((modDepth_+sampleRate_*0.020f*routed[6])*(1.0f+0.02f*playbackDrift*driftWave[0]),0.0f,maximumModDepth_,modDepth_);
-    const float effectiveModRate=modRate_*(1.0f+0.02f*playbackDrift*driftWave[1])*(target_.model == Model::AnalogMod && voicing_ != 1 ? 0.72f : 1.0f);
+    const float routedModRate=bounded(modRate_+20.0f*routed[9],0.01f,20.0f,modRate_);
+    const float effectiveModRate=routedModRate*(1.0f+0.02f*playbackDrift*driftWave[1])*(target_.model == Model::AnalogMod && voicing_ != 1 ? 0.72f : 1.0f);
     const float feedbackCutoffMod=drift*driftWave[2];
     const float exciterAmount=bounded(target_.exciter_amount+routed[7],0.0f,1.0f,target_.exciter_amount);
     float feedbackCompensation=1.0f;
@@ -408,7 +426,7 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         controls.delaySamples=delay;controls.feedback=feedback;controls.tonePole=tonePole;controls.drive=drive;
         controls.modDepthSamples=target_.model == Model::EchoPlatter && !moving ? 0.0f : modDepth;
         controls.modPhase=modPhase_;
-        controls.stereoRatio=target_.stereo_ratio;controls.maximumSamples=maximumSamples_;
+        controls.stereoRatio=stereoRatio;controls.maximumSamples=maximumSamples_;
         controls.voicing=voicing_;
         const auto kind=target_.model == Model::DigitalRack ? rack::Kind::Digital24 :
             (target_.model == Model::EchoPlatter ? rack::Kind::Platter : rack::Kind::Stereo);
@@ -428,7 +446,9 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         output[0] = mixWet(0,delayedL);
         output[1] = mixWet(1,delayedR);
     } else for (unsigned c = 0; c != 2; ++c) {
-        float modelDelay=delay+wow;
+        const float channelDelay=c && stereoTimingActive(target_) ?
+            bounded(delay*stereoRatio,1.0f,maximumSamples_,delay) : delay;
+        float modelDelay=channelDelay+wow;
         if (target_.model == Model::Tape)
             modelDelay+=modDepth*0.25f*(0.8f*modulation+0.2f*flutter);
         else if (target_.model == Model::AnalogMod || target_.model == Model::DigitalMod)
@@ -438,7 +458,9 @@ void Engine::processSample(float inL, float inR, float& outL, float& outR) noexc
         if (target_.model == Model::ExciterEcho)
             loopSignal=voicing_ == 1 ? exciterA04_.process(delayed,c,exciterAmount,drive) :
                 (voicing_ == 2 ? exciterA05_.process(delayed,c,exciterAmount,drive) : exciter_.process(delayed,c,exciterAmount,drive,feedback));
-        float writeValue = excitationGain*input[c] + feedback * feedbackFilter(c,loopSignal);
+        // Ducking and swell shape the wet return only. Fresh input and the
+        // feedback line retain the complete echo so it can emerge after a note.
+        float writeValue = input[c] + feedback * feedbackFilter(c,loopSignal);
         if (target_.model == Model::Analog) {
             // BBD-inspired candidate: two low-pass stages inside the loop.
             writeValue = voicing_ == 1 ? legacy::saturate(writeValue,drive) :

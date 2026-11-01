@@ -22,6 +22,7 @@ enum class Model {
     SweepUp = 18, TubeA04 = 19
 };
 constexpr int modelCount = 20;
+constexpr int modulationDestinationCount = 13; // Published route IDs 0..12.
 
 struct Parameters {
     float delay_ms = 350.0f;
@@ -65,7 +66,16 @@ struct Parameters {
     bool modulation_enabled = true; // CV/wheel and functional envelopes remain.
     bool exciter_highpass_enabled = false; // Opt-in A04 Exciter return HP; legacy presets stay unchanged.
     bool wet_tone_enabled = false; // Optional output LP, separate from model/feedback filters.
+    bool stereo_timing_enabled = false; // Opt-in independent coloured L/R delay times.
 };
+
+inline bool supportsStereoTiming(Model model) noexcept {
+    return model == Model::StereoDelays || model == Model::Analog || model == Model::AnalogMod ||
+        model == Model::Tube || model == Model::TubeA04 || model == Model::Tape;
+}
+inline bool stereoTimingActive(const Parameters& p) noexcept {
+    return p.model == Model::StereoDelays || (p.stereo_timing_enabled && supportsStereoTiming(p.model));
+}
 
 struct ParameterEvent {
     std::size_t offset = 0; // Applied before this sample; frames means after block.
@@ -135,8 +145,10 @@ private:
     float duckThreshold_ = 0.063095734f;
     float duckThresholdTarget_ = 0.063095734f;
     float duckAmount_ = 0.9f;
+    float duckGain_ = 1.0f;
     float swellSlew_ = 0.0f;
     float swellGain_ = 0.0f;
+    float swellTarget_ = 0.0f;
     float sweepLowPole_ = 0.0f;
     float extraFilter1_[2]{};
     float extraFilter2_[2]{};

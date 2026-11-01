@@ -45,3 +45,4 @@ voicing=b06
 modulation_enabled=0
 exciter_highpass_enabled=0
 wet_tone_enabled=1
+stereo_timing_enabled=0

@@ -3,6 +3,7 @@
 #include <new>
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include "clock_sync.h"
 #include "rhythm_labels.h"
 #include "../dsp/output_limiter.h"
@@ -10,7 +11,7 @@
 #include "../dsp/engine.cpp"
 
 #ifndef ECHOLAB_BUILD_ID
-#define ECHOLAB_BUILD_ID "0.7.0-rc.1-dev"
+#define ECHOLAB_BUILD_ID "development"
 #endif
 
 namespace echolab_nt {
@@ -24,25 +25,29 @@ enum Parameter {
     FeedbackLPHz, Drift,
     FeedbackHPHz, LoResEndHz, LoResDecayMs, LoResEnvelopeAmount, RackSampleRateHz,
     LoResCutoffHz, Voicing, ModulationEnabled, Version, RightDivision,
-    FactoryPreset, ExciterHighpassOn, WetToneOn,
+    FactoryPreset, ExciterHighpassOn, WetToneOn, StereoTiming,
     ParameterCount
 };
 #include "factory_presets.h"
 static_assert(ParameterCount<=64,"pending parameter writes use a bounded bit mask");
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free,"the UI boundary snapshot must not lock in audio callbacks");
+static constexpr std::uint64_t initialParameterMask=UINT64_MAX>>(64-ParameterCount);
+static constexpr std::uint32_t uiSnapshotPresent=std::uint32_t(1)<<31;
 static const char* const modelNames[] = {
-    "Digital control", "Analog (provisional)", "Tube B (provisional)",
-    "Ping Pong (provisional)", "Multi-Head (provisional)",
-    "8bit (provisional)", "Dynamic / Ducking (provisional)",
-    "Tape (provisional)", "Sweep Down (provisional)", "Analog Mod (provisional)",
-    "Digital Mod (provisional)", "Reverse (provisional)", "Auto-Volume (provisional)",
-    "Digital Rack (provisional)", "Echo Platter (provisional)", "Stereo Delays (provisional)",
-    "Loop Sampler (provisional)", "Exciter Echo (original)", "Sweep Up (provisional)", "Tube A (provisional)"
+    "Digital control", "Analog", "Tube B",
+    "Ping Pong", "Multi-Head",
+    "8bit", "Dynamic / Ducking",
+    "Tape", "Sweep Down", "Analog Mod",
+    "Digital Mod", "Reverse", "Auto-Volume",
+    "Digital Rack", "Echo Platter", "Stereo Delays",
+    "Loop Sampler", "Exciter Echo", "Sweep Up", "Tube A"
 };
 static const char* const bypassNames[] = {"Active", "Dry", "Tails"};
 static const char* const loopNames[] = {"Stop", "Record", "Play", "Overdub", "Clear"};
 static const char* const onOffNames[] = {"Off", "On"};
 static const char* const sourceNames[] = {"None", "LFO", "Envelope", "CV 1", "CV 2", "Mod wheel"};
-static const char* const destinationNames[] = {"None", "Time", "Feedback", "Tone", "Drive", "Mix", "Depth", "Exciter", "8bit rate"};
+static const char* const destinationNames[] = {"None", "Time", "Feedback", "Tone", "Drive", "Mix", "Depth", "Exciter", "8bit rate",
+                                              "Mod rate", "Stereo ratio", "Drift", "Duck amount"};
 static const char* const voicingNames[] = {"Auto", "A04", "A05", "B06"};
 static const char* const versionNames[] = {"A", "B"};
 static const char* const syncNames[] = {"Free", "MIDI clock", "CV clock", "Internal BPM"};
@@ -50,7 +55,7 @@ static const char* const ppqnNames[] = {"1", "2", "4", "24"};
 static const char* const divisionNames[] = {"1/1", "1/2", "1/4", "1/8", "1/16", "1/4 dotted", "1/8 dotted", "1/4 triplet", "1/8 triplet", "1/16 triplet"};
 static const char* const rightDivisionNames[] = {"Ratio", "1/1", "1/2", "1/4", "1/8", "1/16", "1/4 dotted", "1/8 dotted", "1/4 triplet", "1/8 triplet", "1/16 triplet"};
 // Parameter IDs are preset schema v1. Append future parameters; do not reorder.
-static const _NT_parameter parameters[] = {
+static constexpr _NT_parameter baseParameters[] = {
     NT_PARAMETER_AUDIO_INPUT("Input L", 0, 1)
     NT_PARAMETER_AUDIO_INPUT("Input R", 0, 2)
     NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Output L", 0, 13)
@@ -80,10 +85,10 @@ static const _NT_parameter parameters[] = {
     {"Exciter tune", 200, 10000, 4000, kNT_unitHz, 0, nullptr},
     {"Tap pattern", 0, echolab::multitap::patternCount-1, 0, kNT_unitHasStrings, 0, nullptr},
     {"Mod 1 source", 0, 5, 0, kNT_unitHasStrings, 0, nullptr},
-    {"Mod 1 target", 0, 8, 0, kNT_unitHasStrings, 0, nullptr},
+    {"Mod 1 target", 0, 12, 0, kNT_unitHasStrings, 0, nullptr},
     {"Mod 1 amount", -1000, 1000, 0, kNT_unitPercent, kNT_scaling10, nullptr},
     {"Mod 2 source", 0, 5, 0, kNT_unitHasStrings, 0, nullptr},
-    {"Mod 2 target", 0, 8, 0, kNT_unitHasStrings, 0, nullptr},
+    {"Mod 2 target", 0, 12, 0, kNT_unitHasStrings, 0, nullptr},
     {"Mod 2 amount", -1000, 1000, 0, kNT_unitPercent, kNT_scaling10, nullptr},
     NT_PARAMETER_CV_INPUT("Mod CV 1", 0, 0)
     NT_PARAMETER_CV_INPUT("Mod CV 2", 0, 0)
@@ -107,7 +112,26 @@ static const _NT_parameter parameters[] = {
     {"Preset", 0, preset_bank::slotCount, 0, kNT_unitEnum, 0, preset_bank::names},
     {"Exciter return HP", 0, 1, 0, kNT_unitEnum, 0, onOffNames},
     {"Wet tone", 0, 1, 0, kNT_unitEnum, 0, onOffNames},
+    {"Stereo timing", 0, 1, 0, kNT_unitEnum, 0, onOffNames},
 };
+static_assert(ARRAY_SIZE(baseParameters)==ParameterCount,"every stable parameter has a definition");
+struct ParameterDefinitions { _NT_parameter values[ParameterCount]; };
+static constexpr ParameterDefinitions factoryParameterDefinitions() {
+    ParameterDefinitions definitions{};
+    for(int parameter=0;parameter<ParameterCount;++parameter) {
+        definitions.values[parameter]=baseParameters[parameter];
+        definitions.values[parameter].def=preset_bank::defaultValue(parameter,baseParameters[parameter].def);
+    }
+    // Auto resolves to the recipe's A04 character on Analog. Keep its historical
+    // zero default so old files lacking Voicing51 retain each model's own voice.
+    definitions.values[Voicing].def=0;
+    definitions.values[FactoryPreset].def=static_cast<int16_t>(preset_bank::defaultSlot);
+    return definitions;
+}
+// Defaults are compiled into the host's definitions. Existing saved NT values
+// still belong to the host and are never replaced by an implicit recipe load.
+static constexpr auto factoryParameters=factoryParameterDefinitions();
+static constexpr const _NT_parameter (&parameters)[ParameterCount]=factoryParameters.values;
 static const uint8_t modelParams[] = {FactoryPreset, Model, ModulationEnabled};
 static const uint8_t mainParams[] = {Time, Feedback, Mix};
 static const uint8_t syncedMainParams[] = {Division, Feedback, Mix};
@@ -120,10 +144,14 @@ static const uint8_t legacyResolutionParams[] = {BitDepth, SampleRateHz};
 static const uint8_t rateEnvelopeParams[] = {LoResEndHz, LoResDecayMs, LoResEnvelopeAmount};
 static const uint8_t rackRateParams[] = {RackSampleRateHz};
 static const uint8_t duckParams[] = {DuckThreshold, DuckAmount, Attack, Release};
-static const uint8_t envelopeParams[] = {DuckThreshold, Attack, Release, Swell};
+static const uint8_t envelopeParams[] = {DuckThreshold, DuckAmount, Attack, Release, Swell};
 static const uint8_t stereoParams[] = {StereoRatio};
 static const uint8_t syncedStereoParams[] = {Division, RightDivision};
 static const uint8_t syncedStereoRatioParams[] = {Division, RightDivision, StereoRatio};
+static const uint8_t colouredStereoOffParams[] = {StereoTiming};
+static const uint8_t colouredStereoParams[] = {StereoTiming, StereoRatio};
+static const uint8_t colouredSyncedStereoParams[] = {StereoTiming, Division, RightDivision};
+static const uint8_t colouredSyncedStereoRatioParams[] = {StereoTiming, Division, RightDivision, StereoRatio};
 static const uint8_t loopParams[] = {LoopAction};
 static const uint8_t tapParams[] = {TapPattern};
 static const uint8_t syncedTapParams[] = {Division, TapPattern};
@@ -154,10 +182,12 @@ struct Algorithm : _NT_algorithm {
     bool visibleExciterHighpass = false;
     bool visibleMappedLfo = false;
     bool visibleMappedEnvelope = false;
+    bool visibleStereoTiming = false;
     int observedVersion = 0;
     int observedDestinations[2]{};
     int pendingVoicing = -1;
     int observedPreset = 0;
+    std::uint64_t initialParameters = 0;
     std::uint64_t pendingWrites = 0;
     int16_t desiredValues[ParameterCount]{};
     int16_t sentValues[ParameterCount]{};
@@ -168,6 +198,8 @@ struct Algorithm : _NT_algorithm {
     float maxDelayMs = 3000.0f;
     bool ready = false;
     bool initialControls = true;
+    bool initialNormalizationPending = true;
+    std::atomic<std::uint32_t> initialUiSnapshot{0};
     Algorithm() : _NT_algorithm{} {}
 };
 
@@ -179,6 +211,13 @@ static bool hasVersion(int model) {
 static bool nativeTone(int model) {
     return model==1 || model==2 || model==4 || model==7 || model==8 || model==9 || model==14 || model==18 || model==19;
 }
+static bool colouredStereoModel(int model) {
+    return model!=15 && echolab::supportsStereoTiming(static_cast<echolab::Model>(model));
+}
+static bool hasStereoTiming(const Algorithm* self) {
+    const int model=value(self,Model);
+    return model==15 || (colouredStereoModel(model) && value(self,StereoTiming)!=0);
+}
 static bool meaningfulDestination(const Algorithm* self,int destination) {
     const int model=value(self,Model);
     switch(destination) {
@@ -188,13 +227,20 @@ static bool meaningfulDestination(const Algorithm* self,int destination) {
     case 6: return value(self,ModulationEnabled)!=0 && (model==7 || model==9 || model==10 || model==14);
     case 7: return model==17;
     case 8: return model==5 && value(self,SampleRateHz)!=0;
+    case 9: return value(self,ModulationEnabled)!=0 &&
+        (model==7 || model==8 || model==9 || model==10 || model==14 || model==18 ||
+         value(self,Mod1Source)==1 || value(self,Mod2Source)==1);
+    case 10: return hasStereoTiming(self);
+    case 11: return value(self,ModulationEnabled)!=0 && model!=0 && model!=16 &&
+        echolab::resolvedVoicing(static_cast<echolab::Model>(model),self->controls.voicing)!=1;
+    case 12: return model==6 || model==12;
     default: return false;
     }
 }
 static int selectableDestination(const Algorithm* self,int requested,int previous) {
     if(meaningfulDestination(self,requested)) return requested;
     const int direction=requested>previous ? 1 : -1;
-    for(int target=requested+direction;target>=0 && target<=8;target+=direction)
+    for(int target=requested+direction;target>=0 && target<=12;target+=direction)
         if(meaningfulDestination(self,target)) return target;
     return 0;
 }
@@ -207,8 +253,9 @@ static void updatePages(Algorithm* self, int model, bool notify) {
     const bool exciterHighpass=value(self,ExciterHighpassOn)!=0;
     const bool mappedLfo=value(self,Mod1Source)==1 || value(self,Mod2Source)==1;
     const bool mappedEnvelope=value(self,Mod1Source)==2 || value(self,Mod2Source)==2;
+    const bool stereoTiming=hasStereoTiming(self);
     if(self->visibleModel==model && self->visibleVoicing==voice && self->visibleSyncedTime==syncedTime &&
-       (model!=15 || self->visibleRightRatio==rightRatio) && self->visibleWetTone==wetTone &&
+       (!stereoTiming || self->visibleRightRatio==rightRatio) && self->visibleStereoTiming==stereoTiming && self->visibleWetTone==wetTone &&
        self->visibleExciterHighpass==exciterHighpass && self->visibleMappedLfo==mappedLfo &&
        self->visibleMappedEnvelope==mappedEnvelope) return;
     unsigned count=0;
@@ -252,6 +299,11 @@ static void updatePages(Algorithm* self, int model, bool notify) {
         if(!syncedTime) add("Stereo",stereoParams,ARRAY_SIZE(stereoParams),5);
         else if(rightRatio) add("Stereo",syncedStereoRatioParams,ARRAY_SIZE(syncedStereoRatioParams),5);
         else add("Stereo",syncedStereoParams,ARRAY_SIZE(syncedStereoParams),5);
+    } else if(colouredStereoModel(model)) {
+        if(!stereoTiming) add("Stereo",colouredStereoOffParams,ARRAY_SIZE(colouredStereoOffParams),5);
+        else if(!syncedTime) add("Stereo",colouredStereoParams,ARRAY_SIZE(colouredStereoParams),5);
+        else if(rightRatio) add("Stereo",colouredSyncedStereoRatioParams,ARRAY_SIZE(colouredSyncedStereoRatioParams),5);
+        else add("Stereo",colouredSyncedStereoParams,ARRAY_SIZE(colouredSyncedStereoParams),5);
     }
     if(model==16) add("Looper",loopParams,ARRAY_SIZE(loopParams),5);
     if(model==17) add("Exciter",exciterParams,ARRAY_SIZE(exciterParams),5);
@@ -276,6 +328,7 @@ static void updatePages(Algorithm* self, int model, bool notify) {
     self->visibleExciterHighpass=exciterHighpass;
     self->visibleMappedLfo=mappedLfo;
     self->visibleMappedEnvelope=mappedEnvelope;
+    self->visibleStereoTiming=stereoTiming;
     if(notify) { const auto index=NT_algorithmIndex(self);if(index>=0) NT_updateParameterPages(static_cast<uint32_t>(index)); }
 }
 
@@ -304,7 +357,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
                          const int32_t* specs) {
     auto* self = new (aligned<Algorithm>(ptrs.sram)) Algorithm();
     self->parameters = parameters;
-    updatePages(self,0,false);
+    updatePages(self,parameters[Model].def,false);
     self->maxDelayMs = maxSeconds(specs) * 1000.0f;
     const size_t count = echolab::Engine::requiredSamples(sampleRate(), self->maxDelayMs);
     const uintptr_t padding = ptrs.dram ? reinterpret_cast<uintptr_t>(aligned<float>(ptrs.dram)) - reinterpret_cast<uintptr_t>(ptrs.dram) : 0;
@@ -325,15 +378,24 @@ static void setHostParameter(Algorithm* self,int parameter,int setting) {
     if(index>=0) NT_setParameterFromAudio(static_cast<uint32_t>(index),
                                          static_cast<uint32_t>(parameter)+NT_parameterOffset(),static_cast<int16_t>(setting));
 }
-static void requestParameter(Algorithm* self,int parameter,int setting) {
+static bool stageParameter(Algorithm* self,int parameter,int setting) {
     const auto bit=std::uint64_t(1)<<parameter;
     const int bounded=std::max<int>(parameters[parameter].min,std::min<int>(parameters[parameter].max,setting));
     self->desiredValues[parameter]=static_cast<int16_t>(bounded);
-    if(!(self->pendingWrites&bit)) {
-        self->pendingWrites|=bit;
-        self->sentValues[parameter]=static_cast<int16_t>(bounded);
-        setHostParameter(self,parameter,bounded);
+    if(self->pendingWrites&bit) return false;
+    // An unchanged host value may produce no callback. Do not reserve a write
+    // awaiting an acknowledgement that can never arrive: a later recipe must
+    // still be able to persist its new value after a manual Model edit.
+    if(rawValue(self,parameter)==bounded) {
+        if(parameter==Voicing && self->pendingVoicing==bounded) self->pendingVoicing=-1;
+        return false;
     }
+    self->pendingWrites|=bit;
+    self->sentValues[parameter]=static_cast<int16_t>(bounded);
+    return true;
+}
+static void requestParameter(Algorithm* self,int parameter,int setting) {
+    if(stageParameter(self,parameter,setting)) setHostParameter(self,parameter,self->sentValues[parameter]);
 }
 static float stereoRatio(const Algorithm* self,float leftMs) {
     const int right=value(self,RightDivision);
@@ -362,6 +424,7 @@ static void updateControls(Algorithm* self) {
     self->controls.attack_ms = static_cast<float>(value(self, Attack));
     self->controls.release_ms = static_cast<float>(value(self, Release));
     self->controls.swell_ms = static_cast<float>(value(self, Swell));
+    self->controls.stereo_timing_enabled = value(self,StereoTiming)!=0;
     self->controls.stereo_ratio = stereoRatio(self,self->controls.delay_ms);
     self->controls.loop_action = value(self, LoopAction);
     self->controls.limiter_enabled = value(self,LimiterOn)!=0;
@@ -408,6 +471,48 @@ static bool activePreset(int slot) {
     return slot>=1 && slot<=static_cast<int>(preset_bank::slotCount) &&
         preset_bank::presets[slot-1].values && preset_bank::presets[slot-1].count!=0;
 }
+static bool matchesDefaultRecipeSound(const Algorithm* self) {
+    const auto& preset=preset_bank::presets[preset_bank::defaultSlot-1];
+    for(unsigned i=0;i<preset.count;++i) {
+        const auto& setting=preset.values[i];
+        if(setting.parameter==SyncMode || setting.parameter==TempoBpm || setting.parameter==ClockPpqn) continue;
+        if(setting.parameter==Voicing) {
+            const auto model=static_cast<echolab::Model>(value(self,Model));
+            if(echolab::resolvedVoicing(model,value(self,Voicing))!=echolab::resolvedVoicing(model,setting.value)) return false;
+            continue;
+        }
+        if(value(self,setting.parameter)!=setting.value) return false;
+    }
+    return true;
+}
+static void finishInitialControls(Algorithm* self,int changingParameter=-1) {
+    if(!self->initialControls) return;
+    updateControls(self);
+    updatePages(self,value(self,Model),true);
+    // On UI activation preserve the selector observation captured before the
+    // current changed selector, so this first live choice can be applied.
+    if(changingParameter!=Version) self->observedVersion=value(self,Version);
+    if(changingParameter!=FactoryPreset) self->observedPreset=value(self,FactoryPreset);
+    self->initialControls=false;
+    self->initialUiSnapshot.store(0,std::memory_order_relaxed);
+}
+static void normalizeInitialControls(Algorithm* self) {
+    if(!self->initialNormalizationPending) return;
+    self->initialNormalizationPending=false;
+    // Gate completion itself must not issue setters while loaded callbacks
+    // may still be arriving. Preserve the original first-render migration
+    // boundary and inspect the latest live controls, not an earlier snapshot.
+    if(self->observedPreset==static_cast<int>(preset_bank::defaultSlot) && !matchesDefaultRecipeSound(self)) {
+        // Older NT files may lack Preset55 and inherit its new default4.
+        // Correct that label only; the host's saved sound is authoritative.
+        self->observedPreset=0;
+        requestParameter(self,FactoryPreset,0);
+    }
+    if(hasVersion(value(self,Model)) && self->observedVersion==0 && self->controls.voicing==3) {
+        self->observedVersion=1;
+        requestParameter(self,Version,1);
+    }
+}
 static int selectablePreset(int requested,int previous) {
     if(requested==0 || activePreset(requested)) return requested;
     const int direction=requested>previous ? 1 : -1;
@@ -426,18 +531,12 @@ static void applyPreset(Algorithm* self,int selected) {
         const auto& setting=preset.values[i];
         if(setting.parameter<0 || setting.parameter>=ParameterCount || setting.parameter==FactoryPreset ||
            setting.parameter==SyncMode || setting.parameter==TempoBpm || setting.parameter==ClockPpqn) continue;
-        const int p=setting.parameter;
-        const auto bit=std::uint64_t(1)<<p;
-        const int bounded=std::max<int>(parameters[p].min,std::min<int>(parameters[p].max,setting.value));
-        self->desiredValues[p]=static_cast<int16_t>(bounded);
-        if(!(self->pendingWrites&bit)) { self->pendingWrites|=bit;send|=bit;self->sentValues[p]=static_cast<int16_t>(bounded); }
+        if(stageParameter(self,setting.parameter,setting.value)) send|=std::uint64_t(1)<<setting.parameter;
     }
     if(value(self,SyncMode)==0) {
         // A musical recipe must activate its note values. Keep an existing
         // internal/external clock; Free moves to the user's internal tempo.
-        const auto bit=std::uint64_t(1)<<SyncMode;
-        self->desiredValues[SyncMode]=3;
-        if(!(self->pendingWrites&bit)) { self->pendingWrites|=bit;send|=bit;self->sentValues[SyncMode]=3; }
+        if(stageParameter(self,SyncMode,3)) send|=std::uint64_t(1)<<SyncMode;
     }
     self->observedPreset=selected;
     self->observedVersion=value(self,Version);
@@ -454,6 +553,28 @@ static bool keepsPresetName(int p) {
 void parameterChanged(_NT_algorithm* base, int p) {
     // Coefficients cached in the core; no clearing a delay or allocating here.
     auto* self=static_cast<Algorithm*>(base);
+    if(p<0 || p>=ParameterCount) return;
+    const std::uint32_t uiSnapshot=self->initialControls ? self->initialUiSnapshot.load(std::memory_order_relaxed) : 0;
+    const bool changedUiSelector=(uiSnapshot&uiSnapshotPresent) &&
+        ((p==FactoryPreset && rawValue(self,p)!=static_cast<int>(uiSnapshot&0xffff)) ||
+         (p==Version && rawValue(self,p)!=static_cast<int>((uiSnapshot>>16)&1)) ||
+         (p==Mod1Destination && rawValue(self,p)!=static_cast<int>((uiSnapshot>>17)&15)) ||
+         (p==Mod2Destination && rawValue(self,p)!=static_cast<int>((uiSnapshot>>21)&15)));
+    // Non-selector or identical notifications can still belong to loading.
+    // Keep the first UI snapshot intact until a selector actually differs.
+    if(changedUiSelector) {
+        self->observedPreset=static_cast<int>(uiSnapshot&0xffff);
+        self->observedVersion=static_cast<int>((uiSnapshot>>16)&1);
+        self->observedDestinations[0]=static_cast<int>((uiSnapshot>>17)&15);
+        self->observedDestinations[1]=static_cast<int>((uiSnapshot>>21)&15);
+        finishInitialControls(self,p);
+    }
+    if(self->initialControls && self->initialParameters==0) {
+        // Snapshot selectors even when the host notifies only a subset of the
+        // loaded parameters. Nothing here applies a stored factory recipe.
+        self->observedPreset=rawValue(self,FactoryPreset);
+        self->observedVersion=rawValue(self,Version);
+    }
     const auto bit=std::uint64_t(1)<<p;
     const int raw=rawValue(self,p);
     if(self->pendingWrites&bit) {
@@ -464,7 +585,14 @@ void parameterChanged(_NT_algorithm* base, int p) {
                 self->sentValues[p]=self->desiredValues[p];
                 setHostParameter(self,p,self->sentValues[p]);
             } else self->pendingWrites&=~bit;
-            if(p==Voicing && raw==self->pendingVoicing) self->pendingVoicing=-1;
+            if(p==Voicing && raw==self->pendingVoicing) {
+                self->pendingVoicing=-1;
+                // A native edit may have superseded this temporary Version
+                // override. Its acknowledgement must also release the cached
+                // DSP/page override, not only settle the host-owned value.
+                updateControls(self);
+                updatePages(self,value(self,Model),true);
+            }
             return;
         }
         // An actual edit arrived while an older host write was outstanding.
@@ -497,7 +625,7 @@ void parameterChanged(_NT_algorithm* base, int p) {
     if(p==Mod1Destination || p==Mod2Destination) {
         const int slot=p==Mod1Destination ? 0 : 1;
         const int requested=value(self,p);
-        const int selected=self->initialControls || self->applyingPreset ? requested :
+        const int selected=self->initialControls || self->applyingPreset || requested==self->observedDestinations[slot] ? requested :
             selectableDestination(self,requested,self->observedDestinations[slot]);
         self->observedDestinations[slot]=selected;
         if(selected!=requested) requestParameter(self,p,selected);
@@ -506,6 +634,12 @@ void parameterChanged(_NT_algorithm* base, int p) {
     if(p==ClockBus) self->clock.clearCv();
     updateControls(self);
     updatePages(self,value(self,Model),true);
+    if(self->initialControls) {
+        self->initialParameters|=bit;
+        // A complete initial callback pass is enough to accept later edits;
+        // a bypassed or not-yet-rendered instance must not wait for step().
+        if(self->initialParameters==initialParameterMask) finishInitialControls(self);
+    }
 }
 static void updateClockTime(Algorithm* self) {
     if(self->appliedClockRevision==self->clock.revision()) return;
@@ -525,14 +659,23 @@ void midiMessage(_NT_algorithm* base,uint8_t status,uint8_t data1,uint8_t data2)
 static bool delayLimited(const Algorithm* self) {
     const float requested=self->clock.delayMs(static_cast<float>(value(self,Time)));
     if(requested>self->maxDelayMs) return true;
-    if(value(self,Model)!=15) return false;
+    if(!hasStereoTiming(self)) return false;
     const int right=value(self,RightDivision);
     const float rightMs=self->clock.locked() && right!=0 ? self->clock.lastQuarterMs()*
         static_cast<float>(ClockSync::quarterMultiplier(right-1)) : requested*value(self,StereoRatio)*.01f;
     return rightMs>self->maxDelayMs;
 }
 bool draw(_NT_algorithm* base) {
-    const auto* self=static_cast<Algorithm*>(base);
+    auto* self=static_cast<Algorithm*>(base);
+    // Capture side-effect selectors once, before a possible UI edit. A late
+    // initialization notification with the same value is not a live selection.
+    // Publish the whole snapshot atomically; never update controls/setters here.
+    const std::uint32_t snapshot=uiSnapshotPresent | static_cast<std::uint32_t>(rawValue(self,FactoryPreset)) |
+        (static_cast<std::uint32_t>(rawValue(self,Version))<<16) |
+        (static_cast<std::uint32_t>(rawValue(self,Mod1Destination))<<17) |
+        (static_cast<std::uint32_t>(rawValue(self,Mod2Destination))<<21);
+    std::uint32_t unset=0;
+    self->initialUiSnapshot.compare_exchange_strong(unset,snapshot,std::memory_order_relaxed,std::memory_order_relaxed);
     const char* status="Free Time";
     if(self->clock.mode()==1) status=self->clock.locked() ? "MIDI sync" : "MIDI waiting: manual Time";
     else if(self->clock.mode()==2) status=self->clock.locked() ? "CV sync" : "CV waiting: manual Time";
@@ -549,7 +692,7 @@ bool draw(_NT_algorithm* base) {
 int parameterString(_NT_algorithm* base,int p,int v,char* buffer) {
     if(p==Mod1Source || p==Mod2Source || p==Mod1Destination || p==Mod2Destination) {
         const bool source=p==Mod1Source || p==Mod2Source;
-        const int choice=std::max(0,std::min(source ? 5 : 8,v));
+        const int choice=std::max(0,std::min(source ? 5 : 12,v));
         const char* name=source ? sourceNames[choice] : destinationNames[choice];
         int length=0;
         while(*name && length<kNT_parameterStringSize-1) buffer[length++]=*name++;
@@ -632,22 +775,8 @@ void step(_NT_algorithm* base, float* busFrames, int numFramesBy4) {
     auto* self = static_cast<Algorithm*>(base);
     if (!busFrames || numFramesBy4 <= 0 || static_cast<uint32_t>(numFramesBy4) > NT_globals.maxFramesPerStep / 4) return;
     const size_t n = static_cast<size_t>(numFramesBy4) * 4;
-    if (self->initialControls) {
-        updateControls(self);
-        updatePages(self,value(self,Model),true);
-        // First controls must take effect without clearing a large delay in step().
-        // prepare already initialized defaults; regular sample-rate smoothing applies.
-        self->observedVersion=value(self,Version);
-        self->observedPreset=value(self,FactoryPreset);
-        self->initialControls = false;
-        if(hasVersion(value(self,Model)) && self->observedVersion==0 && self->controls.voicing==3) {
-            // Old presets have no Version53. Reflect their explicit B choice
-            // without changing hidden Voicing51. Cache before the callback,
-            // which may be delivered immediately or later by the host.
-            self->observedVersion=1;
-            requestParameter(self,Version,1);
-        }
-    }
+    if(self->initialControls) finishInitialControls(self);
+    normalizeInitialControls(self);
     const int il = bus(self, InputL), ir = bus(self, InputR);
     const int ol = bus(self, OutputL), oright = bus(self, OutputR);
     const int cv1Bus=bus(self,CV1Bus),cv2Bus=bus(self,CV2Bus),clockBus=bus(self,ClockBus);
@@ -700,7 +829,7 @@ static constexpr _NT_factory factory = [] {
     _NT_factory f = {};
     f.guid = NT_MULTICHAR('E', 'L', 'n', 't');
     f.name = "EchoLabNT";
-    f.description = ECHOLAB_BUILD_ID ": prerelease, control + 18 provisional models + original Exciter";
+    f.description = ECHOLAB_BUILD_ID ": Stereo delays, musical presets and CV/MIDI control";
     f.numSpecifications = 1;
     f.specifications = specifications;
     f.calculateRequirements = calculateRequirements;

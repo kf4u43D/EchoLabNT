@@ -39,7 +39,7 @@ struct ProfileTiming {
         const double minimum=1000.0/sampleRate;
         const double left=std::max(minimum,std::min(static_cast<double>(maxDelayMs),requestedLeftMs()));
         parameters.delay_ms=static_cast<float>(left);
-        if(internal && parameters.model==Model::StereoDelays) {
+        if(internal && stereoTimingActive(parameters)) {
             const double right=std::max(minimum,std::min(static_cast<double>(maxDelayMs),requestedRightMs()));
             parameters.stereo_ratio=static_cast<float>(right/left);
         } else parameters.stereo_ratio=manualStereoRatio;

@@ -45,3 +45,4 @@ voicing=a04
 modulation_enabled=1
 exciter_highpass_enabled=0
 wet_tone_enabled=1
+stereo_timing_enabled=0

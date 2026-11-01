@@ -5,7 +5,10 @@ if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$')
 & (Join-Path $PSScriptRoot 'build_nt.ps1')
 $out = Join-Path $root ('dist/EchoLabNT-public-' + $version)
 New-Item -ItemType Directory -Path $out -Force | Out-Null
-$packageFiles = @('echolabnt.o', 'README.md', 'RELEASE.md', 'docs/INSTALL_NT.md', 'docs/PRESETS.md', 'SDK_LICENSE.txt')
+$packageFiles = @('echolabnt.o', 'BUILD.txt', 'README.md', 'RELEASE.md', 'docs/INSTALL_NT.md', 'docs/PRESETS.md', 'SDK_LICENSE.txt')
+$build = Get-Content -LiteralPath (Join-Path $root 'build/nt/build_manifest.json') -Raw | ConvertFrom-Json
+if ($build.version -ne $version) { throw 'Object build version does not match VERSION.' }
+@("EchoLabNT $version", "Build: $($build.build_id)", "Target: disting NT firmware $($build.target_firmware) / API $($build.api_version)", "SHA-256 echolabnt.o: $($build.sha256)") | Set-Content -LiteralPath (Join-Path $out 'BUILD.txt') -Encoding ascii
 foreach ($name in @('README.md', 'RELEASE.md', 'docs/INSTALL_NT.md', 'docs/PRESETS.md')) {
     $destination = Join-Path $out $name
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
@@ -18,7 +21,7 @@ foreach ($profile in @(Get-ChildItem -LiteralPath (Join-Path $root 'models/prese
     Copy-Item -LiteralPath $profile.FullName -Destination (Join-Path $out ('profiles/' + $profile.Name)) -Force
     $packageFiles += 'profiles/' + $profile.Name
 }
-if ($packageFiles.Count -le 6) { throw 'No factory profiles found.' }
+if ($packageFiles.Count -le 7) { throw 'No factory profiles found.' }
 $checksums = $packageFiles | Sort-Object | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $out $_) -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_ }
 $checksums | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
 $archiveName = 'EchoLabNT-public-' + $version + '.zip'
